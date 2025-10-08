@@ -35,10 +35,9 @@ suitable for training and evaluating computer vision models.
 
 ## Dataset Overview
 
-- **Dataset A**: Contains annotated images of single tea buds with clear backgrounds.
-- **Dataset B**: Includes images of tea buds in natural tea garden environments, with complex backgrounds.
-- **Dataset C**: Provides multi-angle and multi-stage images of tea buds for growth stage recognition and model
-  generalization studies.
+- **Dataset A**: The most complex, consisting of raw images directly captured from real-world environments without special processing, containing a large number of small objects.
+- **Dataset B**: Moderately difficult, with most objects being of medium size and some small objects present.
+- **Dataset C**: The simplest, primarily containing medium to large objects, which are relatively easy to recognize.
 
 ## Access
 
