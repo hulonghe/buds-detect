@@ -64,13 +64,13 @@ if __name__ == '__main__':
     # data_name = "teaRob.v9i.yolov11"
     # data_name = "tea-buds-owns"
     # data_name = "tea-bud-3"
-    data_name = "C"
+    data_name = "A-old"
     data_root = r"E:/resources/datasets/tea-buds-database/" + data_name
 
     mean, std = get_mean_std(
         image_dir=data_root,
         image_size=320,
-        num_workers=4
+        num_workers=8
     )
 
     print("mean:", mean)

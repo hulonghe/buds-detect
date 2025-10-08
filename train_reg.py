@@ -387,7 +387,7 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
     scheduler2 = None
     scheduler_kwargs = dict(
         max_lr=lr, total_steps=epochs * steps_per_epoch,
-        pct_start=0.3, div_factor=10, final_div_factor=100, plateau_up_count=0,
+        pct_start=0.1, div_factor=10, final_div_factor=100, plateau_up_count=0,
         plateau_up_steps=steps_per_epoch * 2, plateau_up_strategy='arithmetic',
         plateau_down_count=0, plateau_down_steps=steps_per_epoch * 2, plateau_down_strategy='exponential',
         num_jumps=0, jump_magnitude=1.5, jump_once_steps=steps_per_epoch,
@@ -519,25 +519,27 @@ if __name__ == '__main__':
     weight_decay = 0.0001
     device_ = 'cuda' if torch.cuda.is_available() else 'cpu'
     ckpt_path = None
-    weights_ = [1.0, 1.2, 3.0]  #- cls,box,iou
+    weights_ = [10.0, 1.2, 5.0]  #- cls,box,iou
     m_name = "default"
-    dropout = 0.1
-    lrs_ = [0.0001]
+    dropout = 0.01
+    lrs_ = [0.001]
     use_transformers = [True]
     use_refines = [True]
     is_fpns = [True]
 
-    backbone_types = ["resnet50"]
+
+    backbone_types = ["resnet101"]
     data_names = [
-        ['A', (0.4206, 0.502, 0.3179), (0.2162, 0.2199, 0.1967)],
+        # ['A', (0.4206, 0.502, 0.3179), (0.2162, 0.2199, 0.1967)],
+        ['A-old', (0.4192, 0.5019, 0.3103), (0.2146, 0.2186, 0.1904)],
         # ['B', (0.4868, 0.5291, 0.3377), (0.2017, 0.2022, 0.1851)],
         # ['C', (0.3908, 0.4763, 0.3021), (0.179, 0.1821, 0.1636)],
         # ['D', (0.4553, 0.5044, 0.3957), (0.2096, 0.2159, 0.1845)]
     ]
     gammas = [1.0]
     alphas = [0.5]
-    scores_thresh = [0.4]
-    ious_thresh = [0.25]
+    scores_thresh = [0.01]
+    ious_thresh = [0.15]
 
     # 遍历所有组合
     best_result = None
@@ -559,8 +561,8 @@ if __name__ == '__main__':
             label_dir=os.path.join(data_root + r"/train", 'labels'),
             img_size=size, normalize_label=True, cls_num=1,
             mean=mean, std=std, mode="train",
-            max_memory_usage=0.7, mosaic_prob=0.3,
-            transforms=get_train_transform(size, mean=mean, std=std, val=False),
+            mosaic_prob=0.3,
+            # transforms=get_train_transform(size, mean=mean, std=std, val=False),
             easy_fraction=1.0
         )
         train_loader_ = DataLoader(train_dataset, batch_size=batch_size_,
@@ -573,7 +575,7 @@ if __name__ == '__main__':
             label_dir=os.path.join(data_root + r"/val", 'labels'),
             img_size=size, cls_num=1,
             mean=mean, std=std, normalize_label=True, mode="val",
-            max_memory_usage=0.7, mosaic_prob=0.0,
+            mosaic_prob=0.0,
             # transforms=get_train_transform(size, mean=mean, std=std, val=True),
         )
         val_loader_ = DataLoader(val_dataset_, batch_size=batch_size_, shuffle=False,

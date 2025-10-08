@@ -155,6 +155,8 @@ def plot_multi_dataset(datasets_stats, dataset_names):
             bins=(50, 50),
             range=[[0, 1], [0, 1]]
         )
+        # ✅ 归一化
+        heatmap = heatmap / heatmap.max()
         # heatmap 绘制
         hm = sns.heatmap(
             heatmap.T,
@@ -183,7 +185,7 @@ def plot_multi_dataset(datasets_stats, dataset_names):
 # 主程序
 # ----------------------
 if __name__ == "__main__":
-    dataset_list = ["A", "B", "C"]
+    dataset_list = ["A-old"]
     dataset_root_base = "E:/resources/datasets/tea-buds-database/"
     datasets_stats = []
     for d in dataset_list:
