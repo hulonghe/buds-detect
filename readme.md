@@ -58,7 +58,7 @@ evaluating tea bud recognition models.
 
 ## 1. System Requirements
 
-- **Operating System:** Windows 10/11, Ubuntu 20.04+, or macOS 13+
+- **Operating System:** Windows 10/11, Ubuntu 20.04+
 - **Hardware Configuration:**
     - GPU: NVIDIA RTX 5070 or higher (≥12 GB VRAM recommended)
     - CPU: Intel i7 / AMD Ryzen 7 or better
