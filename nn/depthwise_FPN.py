@@ -103,7 +103,7 @@ class DynamicDepthwiseFPN(nn.Module):
         # lateral 对齐
         laterals = [self.lateral_convs[i](f) for i, f in enumerate(feats)]
 
-        # top-down 融合
+        # 融合
         if self.is_fpn:
             for i in range(self.num_levels - 1, 0, -1):
                 laterals[i - 1] = laterals[i - 1] + F.interpolate(
@@ -115,6 +115,8 @@ class DynamicDepthwiseFPN(nn.Module):
 
         # 内部仅增强 c0（小目标层）
         outs[0] = self.c0_refine(outs[0])
+        # outs[1] = self.c0_refine(outs[1])
+        # outs[2] = self.c0_refine(outs[2])
 
         # 归一化权重（softmax），放大 c0 贡献但保持总能量可控
         lw = torch.softmax(self.level_weights, dim=0)
@@ -129,9 +131,9 @@ class DynamicDepthwiseFPN(nn.Module):
 if __name__ == "__main__":
     hidden_dim = 128
     feats = [
-        torch.randn(1, 128, 80, 80),  # P1
-        torch.randn(1, 256, 40, 40),  # P2
-        torch.randn(1, 512, 20, 20)  # P3
+        torch.randn(1, 128, 40, 40),  # C3
+        torch.randn(1, 256, 20, 20),  # C4
+        torch.randn(1, 512, 10, 10)  # C5
     ]
     fpn = DynamicDepthwiseFPN(
         in_channels_list=[128, 256, 512],

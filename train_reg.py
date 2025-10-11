@@ -387,7 +387,7 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
     scheduler2 = None
     scheduler_kwargs = dict(
         max_lr=lr, total_steps=epochs * steps_per_epoch,
-        pct_start=0.1, div_factor=10, final_div_factor=100, plateau_up_count=0,
+        pct_start=0.3, div_factor=10, final_div_factor=100, plateau_up_count=0,
         plateau_up_steps=steps_per_epoch * 2, plateau_up_strategy='arithmetic',
         plateau_down_count=0, plateau_down_steps=steps_per_epoch * 2, plateau_down_strategy='exponential',
         num_jumps=0, jump_magnitude=1.5, jump_once_steps=steps_per_epoch,
@@ -430,7 +430,8 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
         # 前期不做验证
         if epoch >= warmup_epochs:
             results = validate_loader(model, device, val_loader, val_dataset, t0, epoch, epochs,
-                                      score_thresh=0.4, iou_thresh=0.15,
+                                      # score_thresh=0.4, iou_thresh=0.15,
+                                      score_thresh=score_thresh, iou_thresh=iou_thresh,
                                       file_base='train', use_softnms=use_softnms, base_path=base_path,
                                       criterion=criterion, warmup_epochs=warmup_epochs, weights_=weights_)
             metrics = results["metrics"]
@@ -519,26 +520,26 @@ if __name__ == '__main__':
     weight_decay = 0.0001
     device_ = 'cuda' if torch.cuda.is_available() else 'cpu'
     ckpt_path = None
-    weights_ = [10.0, 1.2, 5.0]  #- cls,box,iou
+    weights_ = [1.0, 1.2, 3.0]  #- cls,box,i
+    # ou
     m_name = "default"
     dropout = 0.01
     lrs_ = [0.001]
-    use_transformers = [True]
-    use_refines = [True]
+    use_transformers = [False]
+    use_refines = [False]
     is_fpns = [True]
 
-
-    backbone_types = ["resnet101"]
+    backbone_types = ["smallobjnet"]
     data_names = [
         # ['A', (0.4206, 0.502, 0.3179), (0.2162, 0.2199, 0.1967)],
-        ['A-old', (0.4192, 0.5019, 0.3103), (0.2146, 0.2186, 0.1904)],
+        # ['A-old', (0.4192, 0.5019, 0.3103), (0.2146, 0.2186, 0.1904)],
         # ['B', (0.4868, 0.5291, 0.3377), (0.2017, 0.2022, 0.1851)],
-        # ['C', (0.3908, 0.4763, 0.3021), (0.179, 0.1821, 0.1636)],
+        ['C', (0.3908, 0.4763, 0.3021), (0.179, 0.1821, 0.1636)],
         # ['D', (0.4553, 0.5044, 0.3957), (0.2096, 0.2159, 0.1845)]
     ]
     gammas = [1.0]
     alphas = [0.5]
-    scores_thresh = [0.01]
+    scores_thresh = [0.4]
     ious_thresh = [0.15]
 
     # 遍历所有组合
@@ -562,7 +563,7 @@ if __name__ == '__main__':
             img_size=size, normalize_label=True, cls_num=1,
             mean=mean, std=std, mode="train",
             mosaic_prob=0.3,
-            # transforms=get_train_transform(size, mean=mean, std=std, val=False),
+            transforms=get_train_transform(size, mean=mean, std=std, val=False),
             easy_fraction=1.0
         )
         train_loader_ = DataLoader(train_dataset, batch_size=batch_size_,

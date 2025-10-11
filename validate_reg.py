@@ -234,9 +234,9 @@ def run_validation_grid(model_, DEVICE, train_loader_, train_dataset, val_loader
 
     for score_thresh in score_thresh_list:
         for iou_thresh in iou_thresh_list:
-            # for dataset_name, loader_, dataset_ in [("train", train_loader_, train_dataset),
-            #                                         ("val", val_loader_, val_dataset)]:
-            for dataset_name, loader_, dataset_ in [("val", val_loader_, val_dataset)]:
+            for dataset_name, loader_, dataset_ in [("train", train_loader_, train_dataset),
+                                                    ("val", val_loader_, val_dataset)]:
+            # for dataset_name, loader_, dataset_ in [("val", val_loader_, val_dataset)]:
                 print(f"Validating {dataset_name} -> score_thresh: {score_thresh}, iou_thresh: {iou_thresh}")
                 result = validate_loader(
                     model_, DEVICE, loader_, dataset_,
@@ -295,14 +295,14 @@ if __name__ == '__main__':
     # std = (0.179, 0.1821, 0.1636)
     # mean, std = (0.3908, 0.4763, 0.3021), (0.179, 0.1821, 0.1636)
 
-    backbone_type = "resnet50"
+    backbone_type = "resnet34"
     use_softnms = False
     nms_method = "nms"
     img_size = 320
     dropout = 0.0
 
-    # data_name = "A"
-    data_name = "B"
+    data_name = "A-old"
+    # data_name = "B"
     # data_name = "C"
     # data_name = "D"
     data_root = r"E:/resources/datasets/tea-buds-database/" + data_name
@@ -335,7 +335,7 @@ if __name__ == '__main__':
                              num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=1, timeout=60)
 
     # 遍历 runs/ 目录
-    runs_dir = "./runs/ablation"
+    runs_dir = "./runs"
     best_score = -1
     best_config = {}
     best_path = ""
@@ -356,9 +356,9 @@ if __name__ == '__main__':
     for folder in os.listdir(runs_dir):
         # score_thresh_list = [0.4, 0.5, 0.6, 0.7, 0.75]
         # iou_thresh_list = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]
-        score_thresh_list = [0.75]
-        iou_thresh_list = [0.2]
-        if folder != 'daB-m_ablation-ep100-si320-lr0_0001-wa1-baresnet50-iociou-bobalanced-clfocal-io0_25-sc0_4-ga1_0-al0_5-dr0_1-fpTrue-trTrue-reTrue':
+        score_thresh_list = [0.4]
+        iou_thresh_list = [0.15]
+        if folder != 'daA-old-m_default-ep100-si320-lr0_001-wa1-baresnet34-iociou-bososa-clfocal-io0_15-sc0_4-ga1_0-al0_5-dr0_01-fpTrue-trTrue-reTrue':
             # if folder != 'dC-mdefault-e100-i320-l0_0001-w3-bresnet50-iciou-bsosa-cfocal-i0_25-s0_4-g1_0-a0_5-d0_1':  #
             # if folder != 'dteaRob_v9i_yolov11-mdefault-e100-i320-l0_0001-w1-bresnet50-iciou-bsosa-cfocal-i0_25-s0_25-g1_0-a0_5-d0_1':  #
             continue

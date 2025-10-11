@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from nn.FPN import DynamicFPN
 from nn.depthwise_FPN import DynamicDepthwiseFPN
-from nn.small_obj_backbone import SmallObjBackbone
+from nn.small_obj_backbone import EHTBackbone
 
 
 def init_all_heads(model, cls_num):
@@ -70,7 +70,7 @@ class DynamicBoxDetector(nn.Module):
 
         # ---------------- Backbone ---------------- #
         if backbone_type == 'smallobjnet':
-            backbone = SmallObjBackbone(in_ch=in_channels, num_classes=cls_num)
+            backbone = EHTBackbone(in_ch=in_channels, num_classes=cls_num, base_c=64, width_mult=1.0, )
             self.backbone = nn.ModuleDict({
                 'conv1': nn.Identity(),
                 'layer1': nn.Identity(),
@@ -105,7 +105,7 @@ class DynamicBoxDetector(nn.Module):
             dummy = torch.randn(1, 3, in_dim, in_dim)
             feats, _ = self._extract_features(dummy)
             in_channels_list = [f.shape[1] for f in feats]
-            print(f"{'in_channels_list':<24}: {in_channels_list}")
+            print(f"{'in_channels_list':<24}: {[f.shape for f in feats]}")
 
         self.fpn = DynamicDepthwiseFPN(in_channels_list, hidden_dim, dropout=dropout, is_fpn=is_fpn)
 
@@ -114,7 +114,7 @@ class DynamicBoxDetector(nn.Module):
             h3, w3 = fpn_p[0].shape[-2:]
             h4, w4 = fpn_p[1].shape[-2:]
             h5, w5 = fpn_p[2].shape[-2:]
-            print(f"{'PANet P_h_w':<24}: P3={h3}x{w3}, P4={h4}x{w4}, P5={h5}x{w5}")
+            print(f"{'FPN P_h_w':<24}: P3={h3}x{w3}, P4={h4}x{w4}, P5={h5}x{w5}")
 
         # Scale embedding
         self.scale_embed = nn.Embedding(in_channels, hidden_dim)
@@ -173,7 +173,7 @@ class DynamicBoxDetector(nn.Module):
 
     def _extract_features(self, x):
         if self.backbone_type == 'smallobjnet':
-            return self.backbone['_impl'](x)  # 直接返回 [C2,C3,C4,C5]
+            return self.backbone['_impl'](x)  # 直接返回 [C3,C4,C5]
         else:
             x = self.backbone['conv1'](x)
             c2 = self.backbone['layer1'](x)
