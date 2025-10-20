@@ -237,8 +237,7 @@ class DetectionLoss(nn.Module):
         cls_cost[~valid_mask] = 1e5  # 屏蔽无效位置
 
         # === 综合代价：分类 cost - IoU 奖励 ===
-        # cost = cls_cost - 1.5 * ious  # [N, M]
-        cost = cls_cost * 1.0 - ious * 1.5
+        cost = cls_cost * 1.0 - ious * 1.5 # [N, M]
         # === TopK 匈牙利分配 ===
         cur_topk_clamped = min(cur_topk, N)
         topk_cost, topk_idx = torch.topk(cost.T, k=min(cur_topk_clamped, N), largest=False)
@@ -269,7 +268,7 @@ class DetectionLoss(nn.Module):
         """
 
         # 计算过渡阶段的epoch数
-        transition_epoch = int(total_epochs * 0.7)
+        transition_epoch = int(total_epochs * 0.3)
 
         # ---------------- iou_thresh 调度 ----------------
         if epoch < warmup_epoch:

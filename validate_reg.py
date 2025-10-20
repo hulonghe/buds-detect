@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from nn.bbox.EnhancedDynamicBoxDetector_ablation import DynamicBoxDetector
 from utils.YoloDataset import YoloDataset
 from utils.dynamic_postprocess import dynamic_postprocess
-from utils.helper import custom_collate_fn, write_val_log, get_train_transform, set_seed
+from utils.helper import custom_collate_fn, write_val_log, get_train_transform, set_seed, print_metrics_table_row_style
 from utils.metrics import compute_ap_metrics
 from torch.amp import autocast
 import csv
@@ -162,14 +162,8 @@ def validate_loader(model, device, data_loader, dataset,
     )
     save_pr_to_json(metrics, os.path.join(base_path, "pr_result_source.json"))
     print(f"PR 数据已保存到 {os.path.join(base_path, 'pr_result_source.json')}")
-
     metrics.pop("PR", None)  # 如果存在就移除，不存在也不会报错
-    # 打印日志
-    print("\t".join([k for k in metrics.keys() if k != "PR"]))
-    print("\t".join([
-        f"{v:.4f}" if isinstance(v, float) else str(v)
-        for k, v in metrics.items() if k != "PR"
-    ]))
+    print_metrics_table_row_style("Val:", metrics)
 
     # 写入文件
     val_log = write_val_log(epoch, epochs, metrics, log_file=log_file)
@@ -236,7 +230,7 @@ def run_validation_grid(model_, DEVICE, train_loader_, train_dataset, val_loader
         for iou_thresh in iou_thresh_list:
             for dataset_name, loader_, dataset_ in [("train", train_loader_, train_dataset),
                                                     ("val", val_loader_, val_dataset)]:
-            # for dataset_name, loader_, dataset_ in [("val", val_loader_, val_dataset)]:
+                # for dataset_name, loader_, dataset_ in [("val", val_loader_, val_dataset)]:
                 print(f"Validating {dataset_name} -> score_thresh: {score_thresh}, iou_thresh: {iou_thresh}")
                 result = validate_loader(
                     model_, DEVICE, loader_, dataset_,

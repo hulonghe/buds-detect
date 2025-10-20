@@ -7,6 +7,8 @@ import psutil
 import torch
 import torch.utils.data as data
 import cv2
+
+from utils.YOLOAugmentor import YOLOAugmentor
 from utils.helper import get_train_transform
 from utils.bbox import cxywh_to_xyxy
 
@@ -52,6 +54,7 @@ class YoloDataset(data.Dataset):
         self.max_memory_usage = max_memory_usage  # 最大内存使用比例
         self.easy_fraction = easy_fraction
         self.selected_indices = []
+        self.yoloAugmentor = YOLOAugmentor(img_size=img_size, close_mosaic=False, mixup_prob=0.0, copy_paste_prob=0.0)
 
         # 计算允许的最大缓存大小
         self.max_cache_size = self._get_max_cache_size()
@@ -219,7 +222,6 @@ class YoloDataset(data.Dataset):
         return self.label_cache[label_path]
 
     def mosaic_augmentation(self, img_list, label_list):
-        import random, cv2
         target_size = self.img_size
         # 随机中心点
         xc = int(random.uniform(0.25 * target_size, 1.75 * target_size))
@@ -313,6 +315,7 @@ class YoloDataset(data.Dataset):
                 label_list.append(self.load_label(label_path_, orig_w, orig_h, new_w, new_h))
 
             img, boxes = self.mosaic_augmentation(img_list, label_list)
+            # img, boxes = self.yoloAugmentor.mosaic_augmentation(img_list, label_list)
 
         # 3. 应用数据增强 / 预处理（可选）
         if self.transforms:
@@ -469,7 +472,7 @@ if __name__ == '__main__':
         mean=mean,
         std=std,
         mode="train",
-        max_memory_usage=0.0, mosaic_prob=0.3,
+        max_memory_usage=0.0, mosaic_prob=0.0,
         transforms=get_train_transform(img_size, mean=mean, std=std, val=False),
         easy_fraction=1.0
     )

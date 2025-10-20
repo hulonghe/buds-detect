@@ -51,10 +51,10 @@ def write_train_log(epoch, epochs,
             f"Iou Loss: {epoch_iou_loss:.8f}, "
             f"Cls Loss: {epoch_cls_loss:.8f}, "
             f"Box Loss: {epoch_reg_loss:.8f}, "
-            f"lr: {current_lr:.8f}\n")
+            f"lr: {current_lr:.8f}")
 
     with open(log_file, 'a') as f:
-        f.write(line)
+        f.write(line + "\n")
 
     return line
 
@@ -273,12 +273,12 @@ def get_train_transform(img_size=640, path=None, mean=None, std=None, val=False)
             A.MedianBlur(blur_limit=3)
         ], p=0.3),
 
-        # 遮挡模拟
-        A.OneOf([
-            CoarseDropout(num_holes_range=(1, 3), hole_height_range=(0.03, 0.1), hole_width_range=(0.03, 0.1),
-                          fill="random_uniform", p=0.2),
-            A.GridDropout(ratio=0.05, p=0.15)
-        ], p=0.2),
+        # # 遮挡模拟
+        # A.OneOf([
+        #     CoarseDropout(num_holes_range=(1, 3), hole_height_range=(0.03, 0.1), hole_width_range=(0.03, 0.1),
+        #                   fill="random_uniform", p=0.2),
+        #     A.GridDropout(ratio=0.05, p=0.15)
+        # ], p=0.2),
 
         # 尺寸标准化
         A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR, p=1.0),
@@ -537,3 +537,29 @@ def cosine_ramp_up(x, steps, max_val=0.25, min_val=0.0):
     else:
         ratio = (1 - np.cos(np.pi * x / steps)) / 2
         return min_val + (max_val - min_val) * ratio
+
+
+
+# 打印日志
+def print_metrics_table_row_style(title, metrics):
+    print(title)
+    # 格式化键和值为字符串
+    keys = list(metrics.keys())
+    vals = [
+        f"{v:.4f}" if isinstance(v, float) else str(v)
+        for v in metrics.values()
+    ]
+    # 计算每列最大宽度（key/value中较长者）
+    col_widths = [max(len(k), len(v)) + 2 for k, v in zip(keys, vals)]  # +2 for padding
+    # 构建水平线
+    total_width = sum(col_widths) + len(col_widths) - 1  # 加上分隔符数量
+    border = "+" + "-" * (total_width + 2) + "+"
+    print(border)
+    # 打印 keys 行
+    key_line = " | ".join([k.center(w) for k, w in zip(keys, col_widths)])
+    print(f"| {key_line} |")
+    print(border)
+    # 打印 values 行
+    val_line = " | ".join([v.center(w) for v, w in zip(vals, col_widths)])
+    print(f"| {val_line} |")
+    print(border)

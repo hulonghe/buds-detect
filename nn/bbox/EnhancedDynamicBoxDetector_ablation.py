@@ -70,7 +70,7 @@ class DynamicBoxDetector(nn.Module):
 
         # ---------------- Backbone ---------------- #
         if backbone_type == 'smallobjnet':
-            backbone = EHTBackbone(in_ch=in_channels, num_classes=cls_num, base_c=64, width_mult=1.0, )
+            backbone = EHTBackbone(in_ch=in_channels, num_classes=cls_num, base_c=32, width_mult=1.0, )
             self.backbone = nn.ModuleDict({
                 'conv1': nn.Identity(),
                 'layer1': nn.Identity(),

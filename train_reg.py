@@ -14,7 +14,7 @@ from loss.DetectionBoxLoss import DetectionLoss
 from nn.bbox.EnhancedDynamicBoxDetector_ablation import DynamicBoxDetector
 from utils.YoloDataset import YoloDataset
 from utils.helper import write_train_log, print_gpu_usage, custom_collate_fn, \
-    clear_gpu_cache, get_train_transform, set_seed
+    clear_gpu_cache, get_train_transform, set_seed, print_metrics_table_row_style
 from validate_reg import validate_loader
 from torch.amp import autocast, GradScaler
 from optim.OneCyclePlateauJumpLR import OneCyclePlateauJumpLR
@@ -308,7 +308,12 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
     t0 = time.time()
     use_softnms = False
     sum_weighted = True
-
+    model_kwargs = dict(
+        in_dim=img_size, hidden_dim=128, nhead=4, num_layers=2, cls_num=1,
+        once_embed=True, is_split_trans=False, is_fpn=is_fpn,
+        dropout=dropout, backbone_type=backbone_type, device=device,
+        use_transformer=use_transformer, use_refine=use_refine
+    )
     train_params = {
         'epochs': epochs,
         'img_size': img_size,
@@ -364,12 +369,7 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
     print(f"{'alpha':<24}: {alpha}")
 
     scaler = GradScaler()  # 创建一个梯度缩放器
-    model_kwargs = dict(
-        in_dim=img_size, hidden_dim=128, nhead=4, num_layers=2, cls_num=1,
-        once_embed=True, is_split_trans=False, is_fpn=is_fpn,
-        dropout=dropout, backbone_type=backbone_type, device=device,
-        use_transformer=use_transformer, use_refine=use_refine
-    )
+
     print(model_kwargs)
     log_dict_as_table(writer, 'Config/Model_Params', model_kwargs)
     model = DynamicBoxDetector(**model_kwargs).to(device)
@@ -454,7 +454,7 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
                 log_file=f"{base_path}/train_{t0}.txt",
                 mode="Val"
             )
-            print(f"\n{log}")
+            print(f"{log}")
 
             score = results["val_loss"]
             ap_score = compute_score(metrics)
@@ -482,19 +482,15 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
 
         clear_gpu_cache()
 
-    # 打印日志
-    print('best loss:')
-    print("\t".join(best_metrics.keys()))
-    print("\t".join([f"{v:.4f}" if isinstance(v, float) else str(v) for v in best_metrics.values()]))
-    print('best ap loss:')
-    print("\t".join(best_ap_metrics.keys()))
-    print("\t".join([f"{v:.4f}" if isinstance(v, float) else str(v) for v in best_ap_metrics.values()]))
+    print_metrics_table_row_style("best loss:", best_metrics)
+    print_metrics_table_row_style("best ap loss:", best_ap_metrics)
 
     torch.save(model.state_dict(), f'{base_path}/model_epoch_last.pth')
     save_metrics_to_csv(metrics_history, f"{base_path}/val_metrics_log.csv")
     plot_detection_metrics(metrics_history, save_dir=f"{base_path}", start_epoch=warmup_epochs + 1)
 
     return best_metrics
+
 
 
 def worker_init_fn(worker_id):
@@ -507,34 +503,33 @@ if __name__ == '__main__':
     set_seed(seed, False, True)
     base_path = "./runs"
     data_root_base = r"E:/resources/datasets/tea-buds-database/"
-    
+
     iou_loss_types = ['ciou']
     box_loss_types = ['sosa']
     cls_loss_types = ['focal']
 
     freeze_model = False
     size = 320
-    epochs_ = 100
+    epochs_ = 600
     warmup_epochs_ = 1
     batch_size_ = 32
     weight_decay = 0.0001
     device_ = 'cuda' if torch.cuda.is_available() else 'cpu'
     ckpt_path = None
-    weights_ = [1.0, 1.2, 3.0]  #- cls,box,i
-    # ou
+    weights_ = [1.0, 1.2, 3.0]  # - cls,box,iou
     m_name = "default"
     dropout = 0.01
     lrs_ = [0.001]
-    use_transformers = [False]
-    use_refines = [False]
+    use_transformers = [True]
+    use_refines = [True]
     is_fpns = [True]
 
-    backbone_types = ["smallobjnet"]
+    backbone_types = ["resnet50"]
     data_names = [
         # ['A', (0.4206, 0.502, 0.3179), (0.2162, 0.2199, 0.1967)],
         # ['A-old', (0.4192, 0.5019, 0.3103), (0.2146, 0.2186, 0.1904)],
-        # ['B', (0.4868, 0.5291, 0.3377), (0.2017, 0.2022, 0.1851)],
-        ['C', (0.3908, 0.4763, 0.3021), (0.179, 0.1821, 0.1636)],
+        ['B', (0.4868, 0.5291, 0.3377), (0.2017, 0.2022, 0.1851)],
+        # ['C', (0.3908, 0.4763, 0.3021), (0.179, 0.1821, 0.1636)],
         # ['D', (0.4553, 0.5044, 0.3957), (0.2096, 0.2159, 0.1845)]
     ]
     gammas = [1.0]
