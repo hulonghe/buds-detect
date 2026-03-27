@@ -1,9 +1,7 @@
 import torch
 import os
-import time
 import glob
 import pandas as pd
-from thop import clever_format
 from ultralytics import YOLO
 from ultralytics.utils.torch_utils import get_flops_with_torch_profiler
 from nn.bbox.EnhancedDynamicBoxDetector_ablation import DynamicBoxDetector
@@ -13,12 +11,12 @@ from nn.bbox.EnhancedDynamicBoxDetector_ablation import DynamicBoxDetector
 # ============================================================
 IMG_SIZE = 320
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-WARMUP_ITERS = 100
-TEST_ITERS = 500
+WARMUP_ITERS = 50
+TEST_ITERS = 200
 
 # 模型路径
 CUSTOM_MODEL_PATHS = [
-    "./runs/daC-m_default-ep100-si320-lr0_001-wa1-baresnet50-iociou-bososa-clfocal-io0_15-sc0_4-ga1_0-al0_5-dr0_01-fpTrue-trTrue-reTrue/model_epoch_best.pth",
+    "./runs/daC-m_default-ep100-si320-lr0_001-wa1-baresnet34-iociou-bososa-clfocal-io0_15-sc0_4-ga1_0-al0_5-dr0_01-fpTrue-trTrue-reTrue/model_epoch_best.pth",
 ]
 YOLO_MODEL_PATHS = glob.glob("other_models/*.pt")
 
@@ -30,7 +28,7 @@ def load_custom_model(weight_path, device):
     model_kwargs = dict(
         in_dim=IMG_SIZE, hidden_dim=128, nhead=4, num_layers=2, cls_num=1,
         once_embed=True, is_split_trans=False, is_fpn=True,
-        dropout=0.0, backbone_type="resnet50", device=device,
+        dropout=0.0, backbone_type="resnet34", device=device,
         use_transformer=True, use_refine=True
     )
     model = DynamicBoxDetector(**model_kwargs)
@@ -81,7 +79,7 @@ def benchmark_model(model, model_name, weight_path, imgsz=320):
 
     print(f"\n===> Testing model: {model_name}")
     print(f" - Params: {params}")
-    print(f" - FLOPs:  {flops}")
+    print(f" - GFLOPs:  {flops}")
     print(f" - Size:   {size_mb:.2f} MB")
     print(f" - FPS:    {fps:.2f}")
     print(f" - Mem:    {mem_mb:.2f} MB")
@@ -89,7 +87,7 @@ def benchmark_model(model, model_name, weight_path, imgsz=320):
     return dict(
         Model=model_name,
         Params=params,
-        FLOPs=round(flops, 6),
+        GFLOPs=round(flops, 6),
         FPS=round(fps, 2),
         Size_MB=round(size_mb, 2),
         Mem_MB=round(mem_mb, 2),

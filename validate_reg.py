@@ -283,10 +283,10 @@ def run_validation_grid(model_, DEVICE, train_loader_, train_dataset, val_loader
 if __name__ == '__main__':
     set_seed(2025, False)
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    mean = (0.4868, 0.5291, 0.3377)
-    std = (0.2017, 0.2022, 0.1851)
-    # mean = (0.3908, 0.4763, 0.3021)
-    # std = (0.179, 0.1821, 0.1636)
+    # mean = (0.4868, 0.5291, 0.3377)
+    # std = (0.2017, 0.2022, 0.1851)
+    mean = (0.3908, 0.4763, 0.3021)
+    std = (0.179, 0.1821, 0.1636)
     # mean, std = (0.3908, 0.4763, 0.3021), (0.179, 0.1821, 0.1636)
 
     backbone_type = "resnet34"
@@ -295,16 +295,16 @@ if __name__ == '__main__':
     img_size = 320
     dropout = 0.0
 
-    data_name = "A-old"
-    # data_name = "B"
+    # data_name = "A-old"
+    data_name = "B"
     # data_name = "C"
     # data_name = "D"
     data_root = r"E:/resources/datasets/tea-buds-database/" + data_name
 
     # 初始化数据
     train_dataset = YoloDataset(
-        img_dir=os.path.join(data_root, "train", 'images'),
-        label_dir=os.path.join(data_root, "train", 'labels'),
+        img_dir=os.path.join(data_root, "test", 'images'),
+        label_dir=os.path.join(data_root, "test", 'labels'),
         img_size=img_size,
         cls_num=1,
         mean=mean,
@@ -348,11 +348,11 @@ if __name__ == '__main__':
     print(f"{reg_path} 已清空")
 
     for folder in os.listdir(runs_dir):
-        # score_thresh_list = [0.4, 0.5, 0.6, 0.7, 0.75]
-        # iou_thresh_list = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]
-        score_thresh_list = [0.4]
-        iou_thresh_list = [0.15]
-        if folder != 'daA-old-m_default-ep100-si320-lr0_001-wa1-baresnet34-iociou-bososa-clfocal-io0_15-sc0_4-ga1_0-al0_5-dr0_01-fpTrue-trTrue-reTrue':
+        score_thresh_list = [0.4, 0.5, 0.6, 0.7, 0.75]
+        iou_thresh_list = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]
+        # score_thresh_list = [0.4]
+        # iou_thresh_list = [0.15]
+        if folder != 'daC-m_default-ep300-si320-lr0_0001-wa1-baresnet34-iociou-bososa-clfocal-io0_15-sc0_4-ga1_0-al0_5-dr0_01-fpTrue-trTrue-reTrue':
             # if folder != 'dC-mdefault-e100-i320-l0_0001-w3-bresnet50-iciou-bsosa-cfocal-i0_25-s0_4-g1_0-a0_5-d0_1':  #
             # if folder != 'dteaRob_v9i_yolov11-mdefault-e100-i320-l0_0001-w1-bresnet50-iciou-bsosa-cfocal-i0_25-s0_25-g1_0-a0_5-d0_1':  #
             continue
@@ -370,7 +370,7 @@ if __name__ == '__main__':
 
         # 初始化模型
         model_ = DynamicBoxDetector(
-            in_dim=img_size, hidden_dim=128, nhead=4, num_layers=2, cls_num=1,
+            in_dim=img_size, hidden_dim=256, nhead=8, num_layers=2, cls_num=1,
             once_embed=True, is_split_trans=False,
             dropout=dropout, backbone_type=backbone_type,
             is_fpn=True,
