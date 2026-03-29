@@ -11,10 +11,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from loss.DetectionBoxLoss import DetectionLoss
+from loss.DetectionBoxLossV3 import DetectionLossV3
 from nn.bbox.EnhancedDynamicBoxDetector_ablation import DynamicBoxDetector
 from utils.YoloDataset import YoloDataset
 from utils.helper import write_train_log, print_gpu_usage, custom_collate_fn, \
     clear_gpu_cache, get_train_transform, set_seed, print_metrics_table_row_style
+from utils.mean_std import get_mt
 from validate_reg import validate_loader
 from torch.amp import autocast, GradScaler
 from optim.OneCyclePlateauJumpLR import OneCyclePlateauJumpLR
@@ -91,8 +93,20 @@ def generate_filename_from_args(base_path="runs/reg", is_uid=False, **kwargs):
         return k[:2].lower()  # 取前两个字母并小写
 
     def safe_str(k, v):
-        v = 'none' if v == '' else v
-        return f"{short_key(k)}{str(v).replace('.', '_')}"  # 避免小数点冲突文件名
+        # 1. 处理空值
+        if v == '' or v is None:
+            v = 'none'
+
+        # 2. 处理数组/列表/元组情况
+        # 修改点：增加 tuple 判断
+        if isinstance(v, (list, tuple)):
+            # 将序列中的每个元素转为字符串，并用下划线连接
+            v_str = "_".join(str(item).replace('.', '_') for item in v)
+        else:
+            # 处理普通情况（数字、字符串等）
+            v_str = str(v).replace('.', '_')
+
+        return f"{short_key(k)}{v_str}"
 
     # 将所有键值对处理成字符串
     parts = [safe_str(k, v) for k, v in kwargs.items()]
@@ -110,9 +124,9 @@ def compute_score(entry, weights=None):
     # 默认权重设置
     if weights is None:
         weights = {
-            "mAP": 0.3,
-            "AP@0.50": 0.6,
-            "Precision": 0.1,
+            "mAP": 0.4,
+            "AP@0.50": 0.4,
+            "Recall": 0.2,
         }
 
     score = 0.0
@@ -284,7 +298,7 @@ def train_one(model, device, epoch, epochs, warmup_epochs,
     writer.add_scalar('EpochTrain/LossAll', epoch_loss, epoch)
     writer.add_scalar('EpochTrain/LossCls', epoch_cls_loss, epoch)
     writer.add_scalar('EpochTrain/LossBox', epoch_box_loss, epoch)
-    writer.add_scalar('EpochTrain/LossIou', epoch_box_loss, epoch)
+    writer.add_scalar('EpochTrain/LossIou', epoch_iou_loss, epoch)
 
     log = write_train_log(
         epoch, epochs,
@@ -300,11 +314,12 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
            lr=1e-4, warmup_epochs=5, val_dataset=None, val_loader=None, backbone_type="resnet34",
            iou_loss_type='ciou',  # ciou,diou,eiou,giou
            box_loss_type='',  # balanced,gwd,'l1'
-           cls_type="focal",  # focal,vari,bce
+           cls_type="focal",  # focal,vari,bce, quality_focal
            gamma=1.0, alpha=0.25, iou_thresh=0.5, score_thresh=0.25,
            freeze_model=False, weight_decay=0.0005, base_path="/root/autodl-tmp/runs", data_name=None,
            ckpt_path=None, weights_=None, m_name="default", dropout=0.1,
-           use_transformer=True, use_refine=True, is_fpn=True):
+           use_transformer=True, use_refine=True, is_fpn=True,
+           loss_version='v4', simota_topk=20, center_radius=2.5, fpn_weights=(0.5, 0.3, 0.2)):
     t0 = time.time()
     use_softnms = False
     sum_weighted = True
@@ -312,7 +327,8 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
         in_dim=img_size, hidden_dim=128, nhead=4, num_layers=2, cls_num=1,
         once_embed=True, is_split_trans=False, is_fpn=is_fpn,
         dropout=dropout, backbone_type=backbone_type, device=device,
-        use_transformer=use_transformer, use_refine=use_refine
+        use_transformer=use_transformer, use_refine=use_refine,
+        fpn_weights=fpn_weights
     )
     train_params = {
         'epochs': epochs,
@@ -329,7 +345,10 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
         'alpha': alpha,
         'sum_weighted': sum_weighted,
         'device': device,
-        'use_softnms': use_softnms
+        'use_softnms': use_softnms,
+        'loss_version': loss_version,
+        'simota_topk': simota_topk,
+        'center_radius': center_radius
     }
 
     base_path = generate_filename_from_args(
@@ -352,6 +371,9 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
         fpn=is_fpn,
         transformer=use_transformer,
         refine=use_refine,
+        loss=loss_version,
+        weights=weights_,
+        fpn_weights=fpn_weights
     )
     print(f"save path: {base_path}")
     os.makedirs(base_path, exist_ok=True)
@@ -377,10 +399,22 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
         # 加载模型
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
 
-    criterion = DetectionLoss(iou_thresh=iou_thresh, score_thresh=score_thresh,
-                              iou_type=iou_loss_type, box_type=box_loss_type, cls_type=cls_type,
-                              device_type=device, sum_weighted=sum_weighted,
-                              gamma=gamma, alpha=alpha).to(device)
+    if loss_version == 'v3':
+        criterion = DetectionLossV3(
+            iou_thresh=iou_thresh, score_thresh=score_thresh,
+            iou_type=iou_loss_type, box_type=box_loss_type, cls_type=cls_type,
+            device_type=device, sum_weighted=sum_weighted,
+            gamma=gamma, alpha=alpha
+        ).to(device)
+        print(f"{'Loss Version':<24}: V3")
+    else:
+        criterion = DetectionLoss(
+            iou_thresh=iou_thresh, score_thresh=score_thresh,
+            iou_type=iou_loss_type, box_type=box_loss_type, cls_type=cls_type,
+            device_type=device, sum_weighted=sum_weighted,
+            gamma=gamma, alpha=alpha
+        ).to(device)
+        print(f"{'Loss Version':<24}: V1")
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     steps_per_epoch = len(train_dataset) // batch_size_
 
@@ -492,7 +526,6 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
     return best_metrics
 
 
-
 def worker_init_fn(worker_id):
     worker_seed = seed + worker_id
     np.random.seed(worker_seed)
@@ -506,7 +539,7 @@ if __name__ == '__main__':
 
     iou_loss_types = ['ciou']
     box_loss_types = ['sosa']
-    cls_loss_types = ['focal']
+    cls_loss_types = ['vari']
 
     freeze_model = False
     size = 320
@@ -516,48 +549,53 @@ if __name__ == '__main__':
     weight_decay = 0.0001
     device_ = 'cuda' if torch.cuda.is_available() else 'cpu'
     ckpt_path = None
-    weights_ = [1.0, 1.2, 3.0]  # - cls,box,iou
-    m_name = "default"
+    weights_ = [3.0, 16.0, 2.0] # Cls,Box,Iou
+    fpn_weights = (0.5, 0.3, 0.2) # [C3, C4, C5]
     dropout = 0.01
     lrs_ = [0.001]
     use_transformers = [True]
     use_refines = [True]
     is_fpns = [True]
-
-    backbone_types = ["smallobjnet"]
+    loss_versions = ['v3']
+    simota_topks = [15]
+    center_radii = [1.5]
+    m_name = f"new1"
+    backbone_types = ["resnet18"]
     data_names = [
-        # ['A', (0.4206, 0.502, 0.3179), (0.2162, 0.2199, 0.1967)],
-        # ['A-old', (0.4192, 0.5019, 0.3103), (0.2146, 0.2186, 0.1904)],
-        # ['B', (0.4868, 0.5291, 0.3377), (0.2017, 0.2022, 0.1851)],
-        ['C', (0.3908, 0.4763, 0.3021), (0.179, 0.1821, 0.1636)],
-        # ['D', (0.4553, 0.5044, 0.3957), (0.2096, 0.2159, 0.1845)]
+        # 'A',
+        # 'A-old',
+        # 'B',
+        'C',
     ]
-    gammas = [1.0]
+    gammas = [0.5]
     alphas = [0.5]
-    scores_thresh = [0.4]
-    ious_thresh = [0.15]
+    scores_thresh = [0.6]
+    ious_thresh = [0.1]
 
     # 遍历所有组合
     best_result = None
     best_config = None
     for (backbone_type, score_thresh, iou_thresh, lr_, iou_loss_type, box_loss_type, cls_type,
-         gamma, alpha, (data_name, mean, std),
-         use_transformer, use_refine, is_fpn) in itertools.product(
+         gamma, alpha, data_name,
+         use_transformer, use_refine, is_fpn, loss_version, simota_topk, center_radius) in itertools.product(
         backbone_types, scores_thresh, ious_thresh, lrs_,
         iou_loss_types, box_loss_types, cls_loss_types, gammas, alphas, data_names,
-        use_transformers, use_refines, is_fpns):
+        use_transformers, use_refines, is_fpns, loss_versions, simota_topks, center_radii):
+
+        mean, std = get_mt(data_root_base, data_name, size)
         print(
             f"\n训练组合: backbone={backbone_type}, "
             f"iou={iou_loss_type}, box={box_loss_type}, cls={cls_type},"
-            f" gamma={gamma}, alpha={alpha}, lr={lr_}, data_name={data_name}")
+            f" gamma={gamma}, alpha={alpha}, lr={lr_}, data_name={data_name}, loss={loss_version}")
         data_root = os.path.join(data_root_base, data_name)
+
 
         train_dataset = YoloDataset(
             img_dir=os.path.join(data_root + r"/train", 'images'),
             label_dir=os.path.join(data_root + r"/train", 'labels'),
             img_size=size, normalize_label=True, cls_num=1,
             mean=mean, std=std, mode="train",
-            mosaic_prob=0.3,
+            mosaic_prob=0.5,
             transforms=get_train_transform(size, mean=mean, std=std, val=False),
             easy_fraction=1.0
         )
@@ -587,7 +625,6 @@ if __name__ == '__main__':
             backbone_type=backbone_type,
             val_dataset=val_dataset_, val_loader=val_loader_,
             iou_thresh=iou_thresh, score_thresh=score_thresh,
-            # 循环参数
             iou_loss_type=iou_loss_type, box_loss_type=box_loss_type, cls_type=cls_type,
             gamma=gamma, alpha=alpha,
             freeze_model=freeze_model, weight_decay=weight_decay,
@@ -597,7 +634,9 @@ if __name__ == '__main__':
             weights_=weights_,
             m_name=m_name,
             dropout=dropout,
-            use_transformer=use_transformer, use_refine=use_refine, is_fpn=is_fpn
+            use_transformer=use_transformer, use_refine=use_refine, is_fpn=is_fpn,
+            loss_version=loss_version, simota_topk=simota_topk, center_radius=center_radius,
+            fpn_weights=fpn_weights
         )
 
         val_metric = result.get("AP@0.50", 0)
@@ -609,7 +648,10 @@ if __name__ == '__main__':
                 "box_loss_type": box_loss_type,
                 "cls_type": cls_type,
                 "gamma": gamma,
-                "alpha": alpha
+                "alpha": alpha,
+                "loss_version": loss_version,
+                "simota_topk": simota_topk,
+                "center_radius": center_radius
             }
 
     print("\n✅ 最佳组合:")

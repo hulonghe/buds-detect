@@ -213,9 +213,9 @@ def compute_score(entry, weights=None):
     # 默认权重设置
     if weights is None:
         weights = {
-            "mAP": 0.2,
-            "AP@0.50": 0.6,
-            "Precision": 0.2,
+            "mAP": 0.4,
+            "AP@0.50": 0.4,
+            "Recall": 0.2,
         }
 
     score = 0.0
@@ -323,9 +323,8 @@ if __name__ == '__main__':
     std = (0.2017, 0.2022, 0.1851)
     # mean = (0.3908, 0.4763, 0.3021)
     # std = (0.179, 0.1821, 0.1636)
-    # mean, std = (0.3908, 0.4763, 0.3021), (0.179, 0.1821, 0.1636)
 
-    backbone_type = "resnet50"
+    backbone_type = "resnet18"
     use_softnms = False
     nms_method = "nms"
     img_size = 320
@@ -365,7 +364,7 @@ if __name__ == '__main__':
                              num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=1, timeout=60)
 
     # 遍历 runs/ 目录
-    runs_dir = "./runs/ablation"
+    runs_dir = "./runs"
     best_score = -1
     best_config = {}
     best_path = ""
@@ -384,58 +383,66 @@ if __name__ == '__main__':
     print(f"{reg_path} 已清空")
 
     for folder in os.listdir(runs_dir):
-        # score_thresh_list = [0.4, 0.5, 0.6, 0.7, 0.75]
-        # iou_thresh_list = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]
-        score_thresh_list = [0.75]
-        iou_thresh_list = [0.2]
+        try:
+            score_thresh_list = [0.6, 0.7, 0.75]
+            iou_thresh_list = [0.1, 0.15]
+            # score_thresh_list = [0.75]
+            # iou_thresh_list = [0.2]
 
-        is_fpn, use_transformer, use_refine = parse_folder_flags(folder)
+            if 'daB-m_new1-ep100-si320-lr0_001-wa1-baresnet18-iociou-bososa-clvari-io0_1-sc0_6-ga0_5-al0_5-dr0_01-fpTrue-trTrue-reTrue-lov3-we3_0_16_0_2_0-fp0_5_0_3_0_2' not in folder:
+                continue
+            # if 'resnet18' not in folder or 'lov3' not in folder or 'si320' not in folder:
+            #     continue
 
-        folder_path = os.path.join(runs_dir, folder)
-        if not os.path.isdir(folder_path) or folder == "reg":
-            continue
+            is_fpn, use_transformer, use_refine = parse_folder_flags(folder)
 
-        ckpt_path = os.path.join(folder_path, "model_epoch_best.pth")
-        if not os.path.isfile(ckpt_path):
-            print(f"跳过 {folder}：未找到 model_epoch_best.pth")
-            continue
+            folder_path = os.path.join(runs_dir, folder)
+            if not os.path.isdir(folder_path) or folder == "reg":
+                continue
 
-        print(f"验证模型：{folder}")
+            ckpt_path = os.path.join(folder_path, "model_epoch_best.pth")
+            if not os.path.isfile(ckpt_path):
+                print(f"跳过 {folder}：未找到 model_epoch_best.pth")
+                continue
 
-        model_ = DynamicBoxDetector(
-            in_dim=img_size, hidden_dim=128, nhead=4, num_layers=2, cls_num=1,
-            once_embed=True, is_split_trans=False,
-            dropout=dropout, backbone_type=backbone_type,
-            is_fpn=is_fpn,
-            use_transformer=use_transformer,
-            use_refine=use_refine
-        ).to(DEVICE)
-        model_.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+            print(f"验证模型：{folder}")
 
-        output_csv = os.path.join(reg_path, f"validation_{folder}.csv")
-        score, config_ = run_validation_grid(
-            model_,
-            DEVICE,
-            train_loader_,
-            train_dataset,
-            val_loader_,
-            val_dataset,
-            use_softnms=use_softnms,
-            output_csv=output_csv,
-            score_thresh_list=score_thresh_list, iou_thresh_list=iou_thresh_list,
-            nms_method=nms_method,
-            base_path=runs_dir,
-        )
+            model_ = DynamicBoxDetector(
+                in_dim=img_size, hidden_dim=128, nhead=4, num_layers=2, cls_num=1,
+                once_embed=True, is_split_trans=False,
+                dropout=dropout, backbone_type=backbone_type,
+                is_fpn=is_fpn,
+                use_transformer=use_transformer,
+                use_refine=use_refine
+            ).to(DEVICE)
+            model_.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
 
-        # === 新增：存储到列表 ===
-        config_row = {"folder": folder}
-        config_row.update(config_)
-        all_results.append(config_row)
+            output_csv = os.path.join(reg_path, f"validation_{folder}.csv")
+            score, config_ = run_validation_grid(
+                model_,
+                DEVICE,
+                train_loader_,
+                train_dataset,
+                val_loader_,
+                val_dataset,
+                use_softnms=use_softnms,
+                output_csv=output_csv,
+                score_thresh_list=score_thresh_list, iou_thresh_list=iou_thresh_list,
+                nms_method=nms_method,
+                base_path=runs_dir,
+            )
 
-        if score > best_score:
-            best_score = score
-            best_config = config_
-            best_path = folder_path
+            # === 新增：存储到列表 ===
+            config_row = {"folder": folder}
+            config_row.update(config_)
+            all_results.append(config_row)
+
+            if score > best_score:
+                best_score = score
+                best_config = config_
+                best_path = folder_path
+        except Exception as e:
+            print(e)
 
     # === 循环结束后，写入 result.csv ===
     df = pd.DataFrame(all_results)

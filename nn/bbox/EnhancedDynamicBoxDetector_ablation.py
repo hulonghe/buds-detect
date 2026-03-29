@@ -58,8 +58,8 @@ class DynamicBoxDetector(nn.Module):
                  num_layers=2, nhead=8,
                  once_embed=False, is_split_trans=False, is_fpn=True,
                  head_group=1, cls_head_kernel_size=3,
-                 topk=300, dropout=0.2, backbone_type='resnet50', device='cpu',
-                 use_transformer=True, use_refine=True):
+                 topk=300, dropout=0.1, backbone_type='resnet18', device='cpu',
+                 use_transformer=True, use_refine=True, fpn_weights=(0.5, 0.3, 0.2)):
         super().__init__()
         self.is_split_trans = is_split_trans
         self.once_embed = once_embed
@@ -107,7 +107,8 @@ class DynamicBoxDetector(nn.Module):
             in_channels_list = [f.shape[1] for f in feats]
             print(f"{'in_channels_list':<24}: {[f.shape for f in feats]}")
 
-        self.fpn = DynamicDepthwiseFPN(in_channels_list, hidden_dim, dropout=dropout, is_fpn=is_fpn)
+        self.fpn = DynamicDepthwiseFPN(in_channels_list, hidden_dim, dropout=dropout, is_fpn=is_fpn, use_cbam=True,
+                                       init_weights=fpn_weights)
 
         with torch.no_grad():
             fpn_p = self.fpn(feats)
@@ -187,29 +188,36 @@ class DynamicBoxDetector(nn.Module):
         x = x.clamp(min=eps, max=1 - eps)
         return torch.log(x / (1 - x))
 
-    def decode_boxes(self, reg, grid, scale=1.0):
+    def decode_boxes(self, reg, grid, stride, scale=1.0):
         """
-            scal：可调节范围，如0.2表示[-0.2,0.2]
+        改进版 decode：
+        - center: sigmoid offset（稳定）
+        - size: exp（log-space，关键）
+        - stride: 多尺度对齐
         """
-        # 对 tx, ty 使用 tanh() 限制范围，再乘以 scale
-        tx = torch.tanh(reg[:, 0]) * scale
-        ty = torch.tanh(reg[:, 1]) * scale
 
-        # 计算预测中心点，结合 grid 坐标
+        # ===== center offset（更稳定）=====
+        tx = (torch.sigmoid(reg[:, 0]) - 0.5) * 2 * scale
+        ty = (torch.sigmoid(reg[:, 1]) - 0.5) * 2 * scale
+
         cx = (tx + grid[:, 0]).clamp(0., 1.)
         cy = (ty + grid[:, 1]).clamp(0., 1.)
 
-        # 对 tw, th 直接使用 clamp 限制下界防止为0
-        w = reg[:, 2].clamp(min=1e-3, max=1.)
-        h = reg[:, 3].clamp(min=1e-3, max=1.)
+        # ===== size（关键改进：log-space）=====
+        w = torch.exp(reg[:, 2]) * stride
+        h = torch.exp(reg[:, 3]) * stride
 
-        # 计算边界框的左上、右下点
+        # 防止数值爆炸（训练早期很重要）
+        w = w.clamp(max=1.0)
+        h = h.clamp(max=1.0)
+
+        # ===== box =====
         x_min = (cx - w / 2).clamp(0., 1.)
         y_min = (cy - h / 2).clamp(0., 1.)
         x_max = (cx + w / 2).clamp(0., 1.)
         y_max = (cy + h / 2).clamp(0., 1.)
 
-        return torch.stack([x_min, y_min, x_max, y_max], dim=1)  # [B,4,H,W]
+        return torch.stack([x_min, y_min, x_max, y_max], dim=1)
 
     def forward(self, x):
         B = x.size(0)
@@ -221,6 +229,10 @@ class DynamicBoxDetector(nn.Module):
         _, C3, H3, W3 = p3.shape
         _, C4, H4, W4 = p4.shape
         _, C5, H5, W5 = p5.shape
+        # ===== 计算 stride（归一化空间）=====
+        stride3 = 1.0 / H3
+        stride4 = 1.0 / H4
+        stride5 = 1.0 / H5
 
         f_flat_list, pos_list, spatial_shapes = [], [], [(H3, W3), (H4, W4), (H5, W5)]
         pos_full = None
@@ -290,9 +302,9 @@ class DynamicBoxDetector(nn.Module):
             reg4 = reg4 + self.refine_head4(torch.cat([feat4_t, reg4], dim=1))
             reg5 = reg5 + self.refine_head5(torch.cat([feat5_t, reg5], dim=1))
 
-        box3 = self.decode_boxes(reg3, grid3, 1.0)
-        box4 = self.decode_boxes(reg4, grid4, 1.0)
-        box5 = self.decode_boxes(reg5, grid5, 1.0)
+        box3 = self.decode_boxes(reg3, grid3, stride3, scale=0.5)
+        box4 = self.decode_boxes(reg4, grid4, stride4, scale=1.0)
+        box5 = self.decode_boxes(reg5, grid5, stride5, scale=2.0)
 
         score3_flat = score3.flatten(2).permute(0, 2, 1)
         score4_flat = score4.flatten(2).permute(0, 2, 1)

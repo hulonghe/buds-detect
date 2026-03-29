@@ -60,11 +60,21 @@ def get_mean_std(image_dir, image_size=640, sample_size=None, num_workers=8):
     return mean_rounded, std_rounded
 
 
+def get_mt(path, data, size=320, works=8):
+    data_root = os.path.join(path, data)
+    mean, std = get_mean_std(
+        image_dir=data_root,
+        image_size=size,
+        num_workers=works
+    )
+    return mean, std
+
+
 if __name__ == '__main__':
     # data_name = "teaRob.v9i.yolov11"
     # data_name = "tea-buds-owns"
     # data_name = "tea-bud-3"
-    data_name = "A-old"
+    data_name = "C"
     data_root = r"E:/resources/datasets/tea-buds-database/" + data_name
 
     mean, std = get_mean_std(

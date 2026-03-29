@@ -23,7 +23,7 @@ class YoloDataset(data.Dataset):
                  cls_num=1,
                  mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225),
                  mode="train",
-                 max_memory_usage=0.7, mosaic_prob=0.0,
+                 max_memory_usage=0.7, mosaic_prob=0.5,
                  easy_fraction=1.0):
         """
         img_dir: 存放图片的目录

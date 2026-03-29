@@ -49,3 +49,4 @@ runs/*
 save_logs/*
 __pycache__/*
 other_models/*
+yolo26n.pt

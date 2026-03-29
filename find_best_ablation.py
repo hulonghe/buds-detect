@@ -57,4 +57,4 @@ def find_best_models(root_folder='runs'):
 
 
 # 使用
-find_best_models("./runs/ablation")
+find_best_models("./runs")

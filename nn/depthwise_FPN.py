@@ -56,7 +56,7 @@ class LocalRefineC0(nn.Module):
 class DynamicDepthwiseFPN(nn.Module):
     def __init__(self, in_channels_list, out_channels, dropout=0.1,
                  is_fpn=True, use_cbam=True, norm="GN",
-                 init_weights=(0.6, 0.25, 0.15)):
+                 init_weights=(0.5, 0.3, 0.2)):
         """
         feats 输入顺序 = [c0, c1, c2]，对应原来的 [C3, C4, C5]
         外层的 refine_head3/4/5 仍由你的检测 head 挂接使用；此处不改。
