@@ -68,7 +68,8 @@ def validate_loader(model, device, data_loader, dataset,
                     score_thresh=0.25, iou_thresh=0.25,
                     file_base='train', use_softnms=False,
                     base_path='runs/reg', criterion=None,
-                    warmup_epochs=5, weights_=None, nms_method="nms", is_finish=False):
+                    warmup_epochs=5, nms_method="nms", is_finish=False,
+                    img_size=None):
     """
         数据真实框：
             boxes [B,N,4] 已经归一化数据
@@ -104,22 +105,23 @@ def validate_loader(model, device, data_loader, dataset,
         batch_size = imgs.size(0)
 
         with autocast(device_type=device, enabled=True):
-            score_maps, box_maps, aux_logits = model(imgs)
+            cls_scores, reg_preds, iou_preds, features = model(imgs)
             if criterion is not None:
-                total_loss, loss_cls, loss_box, loss_iou = criterion(score_maps, box_maps, aux_logits,
-                                                                     boxes, labels, log_targets,
-                                                                     epoch, epochs, warmup_epochs, weights_)
+                total_loss, loss_cls, loss_box, loss_iou = criterion(cls_scores, reg_preds, iou_preds,
+                                                                     features, boxes, labels,
+                                                                     log_targets, epoch, epochs, warmup_epochs)
                 epoch_loss += total_loss.cpu().item()
                 epoch_iou_loss += loss_iou.cpu().item()
                 epoch_cls_loss += loss_cls.cpu().item()
                 epoch_box_loss += loss_box.cpu().item()
-            score_maps = torch.sigmoid(score_maps)
+            cls_scores = torch.sigmoid(cls_scores)
 
-        score_maps = score_maps.detach().cpu()
-        box_maps = box_maps.detach().cpu()
+        cls_scores = cls_scores.detach().cpu()
+        reg_preds = reg_preds.detach().cpu()
+        img_size_val = img_size if img_size is not None else (dataset.img_size if dataset is not None else 640)
         batch_pred_boxes, batch_pred_scores, batch_pred_labels = dynamic_postprocess(
-            score_maps, box_maps,
-            img_size=(dataset.img_size, dataset.img_size),
+            cls_scores, reg_preds,
+            img_size=(img_size_val, img_size_val),
             score_thresh=score_thresh, iou_thresh=iou_thresh,
             upscale=False, method="soft-nms" if use_softnms == True else nms_method
         )
@@ -168,17 +170,9 @@ def validate_loader(model, device, data_loader, dataset,
     # 写入文件
     val_log = write_val_log(epoch, epochs, metrics, log_file=log_file)
 
-    return {
-        "metrics": metrics,
-        "predictions": all_pred_details,
-        "gt_boxes": all_gts,
-        "score_thresh": score_thresh,
-        "iou_thresh": iou_thresh,
-        "val_loss": epoch_loss,
-        "val_iou_loss": epoch_iou_loss,
-        "val_cls_loss": epoch_cls_loss,
-        "val_box_loss": epoch_box_loss,
-    }
+    val_loss = epoch_loss / max(1, len(data_loader))
+    val_map = metrics.get("mAP", 0)
+    return val_loss, val_map
 
 
 def save_pr_to_json(pr_data, path):

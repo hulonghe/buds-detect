@@ -6,14 +6,13 @@ def complete_ciou(pred_boxes, gt_boxes, eps=1e-7):
     计算 Complete IoU (CIoU) - PyTorch 版本
     pred_boxes: (N, 4) - 预测框 [x1, y1, x2, y2]
     gt_boxes:   (N, 4) - 真实框 [x1, y1, x2, y2]
-    return: (N,) CIoU，范围 [-1,1]，越大越好
+    return: (N,) CIoU，范围 [0,1]，越大越好
     """
-
     # 宽高
-    pred_w = pred_boxes[:, 2] - pred_boxes[:, 0]
-    pred_h = pred_boxes[:, 3] - pred_boxes[:, 1]
-    gt_w = gt_boxes[:, 2] - gt_boxes[:, 0]
-    gt_h = gt_boxes[:, 3] - gt_boxes[:, 1]
+    pred_w = (pred_boxes[:, 2] - pred_boxes[:, 0]).clamp(min=eps)
+    pred_h = (pred_boxes[:, 3] - pred_boxes[:, 1]).clamp(min=eps)
+    gt_w = (gt_boxes[:, 2] - gt_boxes[:, 0]).clamp(min=eps)
+    gt_h = (gt_boxes[:, 3] - gt_boxes[:, 1]).clamp(min=eps)
 
     # 交集
     inter_x1 = torch.max(pred_boxes[:, 0], gt_boxes[:, 0])
@@ -31,15 +30,15 @@ def complete_ciou(pred_boxes, gt_boxes, eps=1e-7):
 
     # IoU
     union_area = pred_area + gt_area - inter_area + eps
-    iou = inter_area / union_area
+    iou = (inter_area / union_area).clamp(min=0.0, max=1.0)
 
     # 外包框对角线平方
     enclose_x1 = torch.min(pred_boxes[:, 0], gt_boxes[:, 0])
     enclose_y1 = torch.min(pred_boxes[:, 1], gt_boxes[:, 1])
     enclose_x2 = torch.max(pred_boxes[:, 2], gt_boxes[:, 2])
     enclose_y2 = torch.max(pred_boxes[:, 3], gt_boxes[:, 3])
-    enclose_w = enclose_x2 - enclose_x1
-    enclose_h = enclose_y2 - enclose_y1
+    enclose_w = (enclose_x2 - enclose_x1).clamp(min=eps)
+    enclose_h = (enclose_y2 - enclose_y1).clamp(min=eps)
     c2 = enclose_w ** 2 + enclose_h ** 2 + eps
 
     # 中心点距离平方
@@ -57,6 +56,8 @@ def complete_ciou(pred_boxes, gt_boxes, eps=1e-7):
 
     # CIoU
     ciou = iou - (rho2 / c2 + alpha * v)
-    # ciou = torch.clamp(ciou, min=-1.0, max=1.0)
-    ciou01 = ((ciou + 1.0) * 0.5).clamp(eps, 1.0 - eps)
+    ciou = torch.clamp(ciou, min=-1.0, max=1.0)
+    
+    # 转换为 [0, 1] 范围
+    ciou01 = ((ciou + 1.0) * 0.5).clamp(min=eps, max=1.0 - eps)
     return ciou01

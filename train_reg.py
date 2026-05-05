@@ -17,7 +17,7 @@ from utils.YoloDataset import YoloDataset
 from utils.helper import write_train_log, print_gpu_usage, custom_collate_fn, \
     clear_gpu_cache, get_train_transform, set_seed, print_metrics_table_row_style
 from utils.mean_std import get_mt
-from validate_reg import validate_loader
+from validate_reg_ablation import validate_loader
 from torch.amp import autocast, GradScaler
 from optim.OneCyclePlateauJumpLR import OneCyclePlateauJumpLR
 from utils.plot import plot_detection_metrics
@@ -258,9 +258,6 @@ def train_one(model, device, epoch, epochs, warmup_epochs,
         scaler.step(optimizer)
         scaler.update()
 
-        if scheduler is not None and epoch > warmup_epochs:
-            scheduler.step()
-
         epoch_loss += total_loss.detach().cpu().item()
         epoch_iou_loss += loss_iou.cpu().item()
         epoch_cls_loss += loss_cls.cpu().item()
@@ -285,6 +282,8 @@ def train_one(model, device, epoch, epochs, warmup_epochs,
 
     if scheduler is None:
         scheduler2.step()
+    elif epoch >= warmup_epochs:
+        scheduler.step()
 
     epoch_loss /= len(train_loader)
     epoch_iou_loss /= len(train_loader)
@@ -319,12 +318,13 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
            freeze_model=False, weight_decay=0.0005, base_path="/root/autodl-tmp/runs", data_name=None,
            ckpt_path=None, weights_=None, m_name="default", dropout=0.1,
            use_transformer=True, use_refine=True, is_fpn=True,
-           loss_version='v4', simota_topk=20, center_radius=2.5, fpn_weights=(0.5, 0.3, 0.2)):
+           loss_version='v4', simota_topk=20, center_radius=2.5, fpn_weights=(0.5, 0.3, 0.2),
+           cls_num=1):
     t0 = time.time()
     use_softnms = False
     sum_weighted = True
     model_kwargs = dict(
-        in_dim=img_size, hidden_dim=128, nhead=4, num_layers=2, cls_num=1,
+        in_dim=img_size, hidden_dim=128, nhead=4, num_layers=2, cls_num=cls_num,
         once_embed=True, is_split_trans=False, is_fpn=is_fpn,
         dropout=dropout, backbone_type=backbone_type, device=device,
         use_transformer=use_transformer, use_refine=use_refine,
@@ -333,6 +333,7 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
     train_params = {
         'epochs': epochs,
         'img_size': img_size,
+        'cls_num': cls_num,
         'lr': lr,
         'warmup_epochs': warmup_epochs,
         'backbone_type': backbone_type,
@@ -464,7 +465,6 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
         # 前期不做验证
         if epoch >= warmup_epochs:
             results = validate_loader(model, device, val_loader, val_dataset, t0, epoch, epochs,
-                                      # score_thresh=0.4, iou_thresh=0.15,
                                       score_thresh=score_thresh, iou_thresh=iou_thresh,
                                       file_base='train', use_softnms=use_softnms, base_path=base_path,
                                       criterion=criterion, warmup_epochs=warmup_epochs, weights_=weights_)
@@ -561,6 +561,7 @@ if __name__ == '__main__':
     center_radii = [1.5]
     m_name = f"new1"
     backbone_types = ["resnet18"]
+    cls_num = 1  # 类别数量
     data_names = [
         # 'A',
         # 'A-old',
@@ -593,7 +594,7 @@ if __name__ == '__main__':
         train_dataset = YoloDataset(
             img_dir=os.path.join(data_root + r"/train", 'images'),
             label_dir=os.path.join(data_root + r"/train", 'labels'),
-            img_size=size, normalize_label=True, cls_num=1,
+            img_size=size, normalize_label=True, cls_num=cls_num,
             mean=mean, std=std, mode="train",
             mosaic_prob=0.5,
             transforms=get_train_transform(size, mean=mean, std=std, val=False),
@@ -607,7 +608,7 @@ if __name__ == '__main__':
         val_dataset_ = YoloDataset(
             img_dir=os.path.join(data_root + r"/val", 'images'),
             label_dir=os.path.join(data_root + r"/val", 'labels'),
-            img_size=size, cls_num=1,
+            img_size=size, cls_num=cls_num,
             mean=mean, std=std, normalize_label=True, mode="val",
             mosaic_prob=0.0,
             # transforms=get_train_transform(size, mean=mean, std=std, val=True),
@@ -636,7 +637,8 @@ if __name__ == '__main__':
             dropout=dropout,
             use_transformer=use_transformer, use_refine=use_refine, is_fpn=is_fpn,
             loss_version=loss_version, simota_topk=simota_topk, center_radius=center_radius,
-            fpn_weights=fpn_weights
+            fpn_weights=fpn_weights,
+            cls_num=cls_num
         )
 
         val_metric = result.get("AP@0.50", 0)

@@ -43,6 +43,7 @@ class OneCyclePlateauJumpLR(_LRScheduler):
         cycle_decay (float): 后续周期 max_lr 衰减倍率（默认为0.5，即减半）
         last_epoch (int): 起始 epoch，默认为 -1
     """
+
     def __init__(self,
                  optimizer,
                  max_lr,
@@ -51,18 +52,19 @@ class OneCyclePlateauJumpLR(_LRScheduler):
                  div_factor=25,
                  final_div_factor=1e4,
                  plateau_up_count=1,
-                 plateau_up_steps=100,
+                 plateau_up_steps=1,
                  plateau_up_strategy='uniform',
                  plateau_down_count=1,
-                 plateau_down_steps=200,
+                 plateau_down_steps=1,
                  plateau_down_strategy='uniform',
                  num_jumps=1,
                  jump_magnitude=1.1,
-                 jump_once_steps=200,
+                 jump_once_steps=1,
                  anneal_strategy='linear',
                  num_cycles=1,
                  cycle_decay=0.5,
-                 last_epoch=-1):
+                 last_epoch=-1,
+                 warmup_epochs=1):
         # 基本参数
         self.base_max_lr = max_lr
         self.total_steps = total_steps
@@ -79,6 +81,7 @@ class OneCyclePlateauJumpLR(_LRScheduler):
         self.plateau_down_count = plateau_down_count
         self.plateau_down_steps = plateau_down_steps
         self.plateau_down_strategy = plateau_down_strategy
+        self.warmup_epochs = warmup_epochs
 
         # 跳跃配置
         self.num_jumps = num_jumps
@@ -199,7 +202,7 @@ class OneCyclePlateauJumpLR(_LRScheduler):
             else:
                 pct = down_step / float(max(1, self.down_steps))
                 lr = self._anneal(self.max_lr, self.final_lr, pct)
-                
+
                 # 跳跃
                 if local_step in self.jump_steps:
                     lr *= self.jump_magnitude
@@ -212,6 +215,10 @@ class OneCyclePlateauJumpLR(_LRScheduler):
         """
         if epoch is None:
             epoch = self.last_epoch + 1
+
+        if epoch is not None and epoch < self.warmup_epochs:
+            return
+
         # 检测周期边界
         if epoch // self.sigle_cycles_steps > self.current_cycle and self.current_cycle + 1 < self.num_cycles:
             self.current_cycle += 1
@@ -222,7 +229,7 @@ class OneCyclePlateauJumpLR(_LRScheduler):
         for pg in self.optimizer.param_groups:
             pg['lr'] = self.last_lr
 
-            
+
 if __name__ == '__main__':
 
     # 构造一个模型和优化器
