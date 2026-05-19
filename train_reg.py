@@ -16,13 +16,14 @@ from nn.bbox.EnhancedDynamicBoxDetector_ablation import DynamicBoxDetector
 from utils.YoloDataset import YoloDataset
 from utils.helper import write_train_log, print_gpu_usage, custom_collate_fn, \
     clear_gpu_cache, get_train_transform, set_seed, print_metrics_table_row_style
-from utils.mean_std import get_mt
 from validate_reg_ablation import validate_loader
 from torch.amp import autocast, GradScaler
 from optim.OneCyclePlateauJumpLR import OneCyclePlateauJumpLR
 from utils.plot import plot_detection_metrics
 from torch.utils.tensorboard import SummaryWriter
 import itertools
+from utils.mean_std import get_mt
+
 
 seed = 2025
 
@@ -133,6 +134,30 @@ def compute_score(entry, weights=None):
     for k, w in weights.items():
         score += entry.get(k, 0) * w
     return score
+
+
+def get_smooth_weights(epoch, epochs):
+    """
+    固定权重：分类与边框均衡，不做余弦调度避免优化目标漂移。
+    """
+    return [1.0, 1.0, 1.0]
+
+
+def get_smooth_val_thresholds(epoch, epochs, final_score_thresh=0.5, final_nms_iou=0.5):
+    """
+    验证阈值：前 30% 轮次快速从宽松过渡到最终值，之后保持稳定。
+    避免全周期余弦导致前期阈值长期过低。
+    """
+    import math
+    transition_epochs = max(1, int(epochs * 0.3))
+    if epoch >= transition_epochs:
+        return final_score_thresh, final_nms_iou
+    progress = epoch / transition_epochs
+    cosine = (1 - math.cos(math.pi * progress)) / 2
+
+    val_score_thresh = 0.1 + (final_score_thresh - 0.1) * cosine
+    val_iou_thresh = 0.4 + (final_nms_iou - 0.4) * cosine
+    return val_score_thresh, val_iou_thresh
 
 
 def is_better_metrics(metrics: dict, best_metrics: dict, primary_key='AP@0.50', secondary_key='F1', delta=1e-4) -> bool:
@@ -258,6 +283,9 @@ def train_one(model, device, epoch, epochs, warmup_epochs,
         scaler.step(optimizer)
         scaler.update()
 
+        if scheduler is not None and epoch > warmup_epochs:
+            scheduler.step()
+
         epoch_loss += total_loss.detach().cpu().item()
         epoch_iou_loss += loss_iou.cpu().item()
         epoch_cls_loss += loss_cls.cpu().item()
@@ -282,8 +310,6 @@ def train_one(model, device, epoch, epochs, warmup_epochs,
 
     if scheduler is None:
         scheduler2.step()
-    elif epoch >= warmup_epochs:
-        scheduler.step()
 
     epoch_loss /= len(train_loader)
     epoch_iou_loss /= len(train_loader)
@@ -318,13 +344,12 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
            freeze_model=False, weight_decay=0.0005, base_path="/root/autodl-tmp/runs", data_name=None,
            ckpt_path=None, weights_=None, m_name="default", dropout=0.1,
            use_transformer=True, use_refine=True, is_fpn=True,
-           loss_version='v4', simota_topk=20, center_radius=2.5, fpn_weights=(0.5, 0.3, 0.2),
-           cls_num=1):
+           loss_version='v4', simota_topk=20, center_radius=2.5, fpn_weights=(0.5, 0.3, 0.2), cls_nums=1):
     t0 = time.time()
     use_softnms = False
     sum_weighted = True
     model_kwargs = dict(
-        in_dim=img_size, hidden_dim=128, nhead=4, num_layers=2, cls_num=cls_num,
+        in_dim=img_size, hidden_dim=128, nhead=4, num_layers=2, cls_num=cls_nums,
         once_embed=True, is_split_trans=False, is_fpn=is_fpn,
         dropout=dropout, backbone_type=backbone_type, device=device,
         use_transformer=use_transformer, use_refine=use_refine,
@@ -333,7 +358,6 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
     train_params = {
         'epochs': epochs,
         'img_size': img_size,
-        'cls_num': cls_num,
         'lr': lr,
         'warmup_epochs': warmup_epochs,
         'backbone_type': backbone_type,
@@ -397,7 +421,6 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
     log_dict_as_table(writer, 'Config/Model_Params', model_kwargs)
     model = DynamicBoxDetector(**model_kwargs).to(device)
     if ckpt_path is not None:
-        # 加载模型
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
 
     if loss_version == 'v3':
@@ -405,7 +428,7 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
             iou_thresh=iou_thresh, score_thresh=score_thresh,
             iou_type=iou_loss_type, box_type=box_loss_type, cls_type=cls_type,
             device_type=device, sum_weighted=sum_weighted,
-            gamma=gamma, alpha=alpha
+            gamma=gamma, alpha=alpha, cls_num=cls_nums
         ).to(device)
         print(f"{'Loss Version':<24}: V3")
     else:
@@ -416,16 +439,30 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
             gamma=gamma, alpha=alpha
         ).to(device)
         print(f"{'Loss Version':<24}: V1")
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = optim.AdamW(
+            model.parameters(),
+            lr=lr,                # 学习率
+            betas=(0.9, 0.999),      # 动量参数
+            eps=1e-8,                # 数值稳定性
+            weight_decay=weight_decay,       # 权重衰减，解耦后通常设 0.01 ~ 0.1
+            amsgrad=False
+        )
     steps_per_epoch = len(train_dataset) // batch_size_
 
     scheduler2 = None
     scheduler_kwargs = dict(
         max_lr=lr, total_steps=epochs * steps_per_epoch,
-        pct_start=0.3, div_factor=10, final_div_factor=100, plateau_up_count=0,
-        plateau_up_steps=steps_per_epoch * 2, plateau_up_strategy='arithmetic',
-        plateau_down_count=0, plateau_down_steps=steps_per_epoch * 2, plateau_down_strategy='exponential',
-        num_jumps=0, jump_magnitude=1.5, jump_once_steps=steps_per_epoch,
+        pct_start=0.3, div_factor=10, final_div_factor=100,
+        plateau_up_count=0,
+        plateau_up_steps=steps_per_epoch * 3,
+        plateau_up_strategy='arithmetic',
+        plateau_down_count=1,
+        plateau_down_steps=steps_per_epoch * 2,
+        plateau_down_strategy='exponential',
+        num_jumps=0,
+        jump_magnitude=1.3,
+        jump_once_steps=steps_per_epoch,
         anneal_strategy='cos', num_cycles=1, cycle_decay=1,
     )
     print(scheduler_kwargs)
@@ -453,21 +490,23 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
             now_lr = param_group['lr']
             break
 
+        dynamic_weights = get_smooth_weights(epoch, epochs)
+        val_score_thresh, val_nms_iou = get_smooth_val_thresholds(epoch, epochs)
+
         last_cls_loss, last_box_loss, last_iou_loss = train_one(model, device,
                                                                 epoch, epochs, warmup_epochs, train_loader,
                                                                 criterion, optimizer, scheduler, scheduler2, t0,
                                                                 scaler, base_path=base_path, writer=writer,
-                                                                weights_=weights_, freeze_model=freeze_model)
+                                                                weights_=dynamic_weights, freeze_model=freeze_model)
         list_cls_loss.append(last_cls_loss)
         list_box_loss.append(last_box_loss)
         list_iou_loss.append(last_iou_loss)
 
-        # 前期不做验证
         if epoch >= warmup_epochs:
             results = validate_loader(model, device, val_loader, val_dataset, t0, epoch, epochs,
-                                      score_thresh=score_thresh, iou_thresh=iou_thresh,
+                                      score_thresh=val_score_thresh, iou_thresh=val_nms_iou,
                                       file_base='train', use_softnms=use_softnms, base_path=base_path,
-                                      criterion=criterion, warmup_epochs=warmup_epochs, weights_=weights_)
+                                      criterion=criterion, warmup_epochs=warmup_epochs, weights_=dynamic_weights)
             metrics = results["metrics"]
             metrics['lr'] = now_lr
             metrics['epoch'] = epoch
@@ -478,6 +517,8 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
             metrics_history.append(metrics)
 
             for name, value in metrics.items():
+                if 'per_class_stats' in name:
+                    continue
                 writer.add_scalar(f'Val/{name}', value, epoch)
 
             log = write_train_log(
@@ -492,6 +533,8 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
 
             score = results["val_loss"]
             ap_score = compute_score(metrics)
+            cur_f1 = 2 * metrics.get('Recall', 0) * metrics.get('Precision', 0) / (metrics.get('Recall', 0) + metrics.get('Precision', 0) + 1e-6)
+
             if best_metrics is None:
                 best_metrics = metrics
                 best_score = score
@@ -504,15 +547,18 @@ def trains(epochs=1000, train_loader=None, img_size=640, device="cuda",
             if best_ap_metrics is None:
                 best_ap_metrics = metrics
                 best_ap_score = ap_score
-            elif best_ap_metrics is not None and ap_score > best_ap_score:
-                best_ap_score = ap_score
-                best_ap_metrics = metrics
-                if epoch > 10:
-                    torch.save(model.state_dict(), f'{base_path}/model_epoch_best.pth')
+                torch.save(model.state_dict(), f'{base_path}/model_epoch_best.pth')
+            else:
+                best_f1 = 2 * best_ap_metrics.get('Recall', 0) * best_ap_metrics.get('Precision', 0) / (best_ap_metrics.get('Recall', 0) + best_ap_metrics.get('Precision', 0) + 1e-6)
+                if cur_f1 > best_f1 + 1e-4:
+                    best_ap_score = ap_score
+                    best_ap_metrics = metrics
+                    if epoch > 10:
+                        torch.save(model.state_dict(), f'{base_path}/model_epoch_best.pth')
 
             print(
-                f"best ap: {best_ap_metrics['AP@0.50']} epoch: {best_ap_metrics['epoch']} mAP: {best_ap_metrics['mAP']}")
-            print(f"best low loss: {best_metrics['AP@0.50']} epoch: {best_metrics['epoch']} mAP: {best_metrics['mAP']}")
+                f"best F1: {best_ap_metrics.get('F1', 0):.4f} epoch: {best_ap_metrics['epoch']} mAP0.5: {best_ap_metrics['mAP@0.50']} mAP: {best_ap_metrics['mAP']}")
+            print(f"best low loss: {best_metrics['mAP@0.50']} epoch: {best_metrics['epoch']} mAP: {best_metrics['mAP']}")
 
         clear_gpu_cache()
 
@@ -535,7 +581,7 @@ def worker_init_fn(worker_id):
 if __name__ == '__main__':
     set_seed(seed, False, True)
     base_path = "./runs"
-    data_root_base = r"E:/resources/datasets/tea-buds-database/"
+    data_root_base = r"/root/autodl-tmp"
 
     iou_loss_types = ['ciou']
     box_loss_types = ['sosa']
@@ -546,10 +592,10 @@ if __name__ == '__main__':
     epochs_ = 100
     warmup_epochs_ = 1
     batch_size_ = 32
-    weight_decay = 0.0001
+    weight_decay = 0.01
     device_ = 'cuda' if torch.cuda.is_available() else 'cpu'
     ckpt_path = None
-    weights_ = [3.0, 16.0, 2.0] # Cls,Box,Iou
+    weights_ = [5.0, 6.0, 2.0] # Cls,Box,Iou
     fpn_weights = (0.5, 0.3, 0.2) # [C3, C4, C5]
     dropout = 0.01
     lrs_ = [0.001]
@@ -561,17 +607,21 @@ if __name__ == '__main__':
     center_radii = [1.5]
     m_name = f"new1"
     backbone_types = ["resnet18"]
-    cls_num = 1  # 类别数量
+    cls_nums = 1
     data_names = [
         # 'A',
-        # 'A-old',
-        # 'B',
+        'A-old',
+        # 'A-Crop',
+        'B',
         'C',
+        # 'D',
+        # 'E',
+        # 'F',
     ]
-    gammas = [0.5]
+    gammas = [2.5]
     alphas = [0.5]
-    scores_thresh = [0.6]
-    ious_thresh = [0.1]
+    scores_thresh = [0.25]
+    ious_thresh = [0.7]
 
     # 遍历所有组合
     best_result = None
@@ -582,7 +632,6 @@ if __name__ == '__main__':
         backbone_types, scores_thresh, ious_thresh, lrs_,
         iou_loss_types, box_loss_types, cls_loss_types, gammas, alphas, data_names,
         use_transformers, use_refines, is_fpns, loss_versions, simota_topks, center_radii):
-
         mean, std = get_mt(data_root_base, data_name, size)
         print(
             f"\n训练组合: backbone={backbone_type}, "
@@ -590,31 +639,30 @@ if __name__ == '__main__':
             f" gamma={gamma}, alpha={alpha}, lr={lr_}, data_name={data_name}, loss={loss_version}")
         data_root = os.path.join(data_root_base, data_name)
 
-
         train_dataset = YoloDataset(
             img_dir=os.path.join(data_root + r"/train", 'images'),
             label_dir=os.path.join(data_root + r"/train", 'labels'),
-            img_size=size, normalize_label=True, cls_num=cls_num,
+            img_size=size, normalize_label=True, cls_num=cls_nums,
             mean=mean, std=std, mode="train",
             mosaic_prob=0.5,
             transforms=get_train_transform(size, mean=mean, std=std, val=False),
             easy_fraction=1.0
         )
         train_loader_ = DataLoader(train_dataset, batch_size=batch_size_,
-                                   shuffle=True, num_workers=4,
+                                   shuffle=True, num_workers=8,
                                    collate_fn=custom_collate_fn, pin_memory=True, persistent_workers=True,
                                    prefetch_factor=1, worker_init_fn=worker_init_fn)
 
         val_dataset_ = YoloDataset(
             img_dir=os.path.join(data_root + r"/val", 'images'),
             label_dir=os.path.join(data_root + r"/val", 'labels'),
-            img_size=size, cls_num=cls_num,
+            img_size=size, cls_num=cls_nums,
             mean=mean, std=std, normalize_label=True, mode="val",
             mosaic_prob=0.0,
             # transforms=get_train_transform(size, mean=mean, std=std, val=True),
         )
         val_loader_ = DataLoader(val_dataset_, batch_size=batch_size_, shuffle=False,
-                                 collate_fn=custom_collate_fn, num_workers=4,
+                                 collate_fn=custom_collate_fn, num_workers=8,
                                  pin_memory=True, persistent_workers=True,
                                  prefetch_factor=1)
 
@@ -638,7 +686,7 @@ if __name__ == '__main__':
             use_transformer=use_transformer, use_refine=use_refine, is_fpn=is_fpn,
             loss_version=loss_version, simota_topk=simota_topk, center_radius=center_radius,
             fpn_weights=fpn_weights,
-            cls_num=cls_num
+            cls_nums=cls_nums
         )
 
         val_metric = result.get("AP@0.50", 0)

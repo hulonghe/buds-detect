@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from nn.bbox.EnhancedDynamicBoxDetector_ablation import DynamicBoxDetector
 from utils.YoloDataset import YoloDataset
 from utils.dynamic_postprocess import dynamic_postprocess
-from utils.helper import custom_collate_fn, write_val_log, get_train_transform, set_seed, print_metrics_table_row_style
+from utils.helper import custom_collate_fn, write_val_log, get_train_transform, set_seed,print_metrics_table_row_style
 from utils.metrics import compute_ap_metrics
 from torch.amp import autocast
 import csv
@@ -15,6 +15,7 @@ import time
 import torch
 from tqdm import tqdm
 import os
+from utils.mean_std import get_mt
 
 
 def save_predictions_to_txt(batch_pred_boxes, batch_pred_scores, batch_pred_labels, img_paths, save_dir):
@@ -151,7 +152,6 @@ def validate_loader(model, device, data_loader, dataset,
     epoch_box_loss /= len(data_loader)
 
     # === AP / Precision 等指标 ===
-    # === AP / Precision 等指标 ===
     metrics = compute_ap_metrics(
         all_predictions,
         all_gts,
@@ -160,12 +160,28 @@ def validate_loader(model, device, data_loader, dataset,
         plot_pr=is_finish,
         save_path=os.path.join(base_path, "PR.png"),
         model_name="Ours",
+        cls_num=dataset.cls_num
     )
     save_pr_to_json(metrics, os.path.join(base_path, "pr_result_source.json"))
     print(f"PR 数据已保存到 {os.path.join(base_path, 'pr_result_source.json')}")
 
+    per_class_stats = metrics['per_class_stats']
     metrics.pop("PR", None)  # 如果存在就移除，不存在也不会报错
+    metrics.pop("per_class_stats", None)
     print_metrics_table_row_style("Val:", metrics)
+    print("--- Per-Class Statistics ---")
+    headers = ['Class ID', 'AP', 'Precision', 'Recall', 'F1', 'Total GT']
+    print("\t".join(headers))
+    for stat in per_class_stats:
+        row = [
+            str(stat['class_id']),
+            f"{stat['AP']:.4f}",
+            f"{stat['Precision']:.4f}",
+            f"{stat['Recall']:.4f}",
+            f"{stat['F1']:.4f}",
+            str(stat['Total_GT'])
+        ]
+        print("\t".join(row))
 
     # 写入文件
     val_log = write_val_log(epoch, epochs, metrics, log_file=log_file)
@@ -221,7 +237,7 @@ def compute_score(entry, weights=None):
 
 def run_validation_grid(model_, DEVICE, train_loader_, train_dataset, val_loader_, val_dataset, use_softnms=False,
                         output_csv="validation_results.csv", score_thresh_list=[0.4], iou_thresh_list=[0.1],
-                        nms_method="nms", base_path="runs/reg"):
+                        nms_method="nms", base_path="runs/reg", folder=None):
     t0 = time.time()
     results = []
 
@@ -230,10 +246,10 @@ def run_validation_grid(model_, DEVICE, train_loader_, train_dataset, val_loader
 
     for score_thresh in score_thresh_list:
         for iou_thresh in iou_thresh_list:
-            # for dataset_name, loader_, dataset_ in [("train", train_loader_, train_dataset),
-            #                                         ("val", val_loader_, val_dataset)]:
-            for dataset_name, loader_, dataset_ in [("val", val_loader_, val_dataset)]:
-                print(f"Validating {dataset_name} -> score_thresh: {score_thresh}, iou_thresh: {iou_thresh}")
+            for dataset_name, loader_, dataset_ in [("train", train_loader_, train_dataset),
+                                                    ("val", val_loader_, val_dataset)]:
+            # for dataset_name, loader_, dataset_ in [("val", val_loader_, val_dataset)]:
+                print(f"({train_dataset.mode}) Validating {dataset_name} -> score_thresh: {score_thresh}, iou_thresh: {iou_thresh}")
                 result = validate_loader(
                     model_, DEVICE, loader_, dataset_,
                     score_thresh=score_thresh,
@@ -248,15 +264,16 @@ def run_validation_grid(model_, DEVICE, train_loader_, train_dataset, val_loader
 
                 metrics = result["metrics"]
                 entry = {
+                    "folder": folder,
                     "dataset": dataset_name,
                     "score_thresh": score_thresh,
                     "iou_thresh": iou_thresh,
                     "mAP": metrics.get("mAP", 0),
-                    "AP@0.50": metrics.get("AP@0.50", 0),
+                    "AP@0.50": metrics.get("mAP@0.50", 0),
                     "Precision": metrics.get("Precision", 0),
                     "Recall": metrics.get("Recall", 0),
                     "F1": metrics.get("F1", 0),
-                    "MR": metrics.get("MR", 0)
+                    "MR": metrics.get("MR", 0),
                 }
                 score = compute_score(entry)
                 entry["score"] = score
@@ -274,14 +291,19 @@ def run_validation_grid(model_, DEVICE, train_loader_, train_dataset, val_loader
         print(f"{k}: {v}")
 
     # 保存CSV
+    file_exists = os.path.exists(output_csv)
     if results:
         keys = results[0].keys()
-        with open(output_csv, 'w', newline='') as f:
+        with open(output_csv, 'a', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=keys)
-            writer.writeheader()
+            
+            # 只有文件不存在或为空才写 header
+            if not file_exists or os.path.getsize(output_csv) == 0:
+                writer.writeheader()
+            
             writer.writerows(results)
 
-    return best_score, best_config
+    return best_score, best_config, results
 
 
 def parse_folder_flags(folder: str):
@@ -314,55 +336,27 @@ def parse_folder_flags(folder: str):
 if __name__ == '__main__':
     set_seed(2025, False)
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    mean = (0.4868, 0.5291, 0.3377)
-    std = (0.2017, 0.2022, 0.1851)
-    # mean = (0.3908, 0.4763, 0.3021)
-    # std = (0.179, 0.1821, 0.1636)
 
+    cls_nums = 1
     backbone_type = "resnet18"
-    use_softnms = False
+    use_softnms = True
     nms_method = "nms"
     img_size = 320
     dropout = 0.0
 
-    # data_name = "A"
-    data_name = "B"
-    # data_name = "C"
-    # data_name = "D"
-    data_root = r"E:/resources/datasets/tea-buds-database/" + data_name
-
-    # 初始化数据
-    train_dataset = YoloDataset(
-        img_dir=os.path.join(data_root, "train", 'images'),
-        label_dir=os.path.join(data_root, "train", 'labels'),
-        img_size=img_size,
-        cls_num=1,
-        mean=mean,
-        std=std,
-        normalize_label=True,
-        mode='val',
-    )
-    train_loader_ = DataLoader(train_dataset, batch_size=16, shuffle=False, collate_fn=custom_collate_fn,
-                               num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=1, timeout=60)
-
-    val_dataset = YoloDataset(
-        img_dir=os.path.join(data_root, "val", 'images'),
-        label_dir=os.path.join(data_root, "val", 'labels'),
-        img_size=img_size,
-        cls_num=1,
-        mean=mean,
-        std=std,
-        mode='val',
-        normalize_label=True
-    )
-    val_loader_ = DataLoader(val_dataset, batch_size=16, shuffle=False, collate_fn=custom_collate_fn,
-                             num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=1, timeout=60)
-
+    data_names = [
+        # 'A',
+        # 'A-old',
+        # 'A-Crop',
+        # 'B',
+        'C',
+        # 'D',
+        # 'E',
+        # 'F',
+    ]
+    data_root_base = r"/root/autodl-tmp/"
     # 遍历 runs/ 目录
     runs_dir = "./runs"
-    best_score = -1
-    best_config = {}
-    best_path = ""
     all_results = []  # 存储所有 config_
 
     reg_path = os.path.join(runs_dir, "reg")
@@ -376,76 +370,111 @@ if __name__ == '__main__':
     else:
         os.makedirs(reg_path)
     print(f"{reg_path} 已清空")
+    output_csv = os.path.join(reg_path, f"validation.csv")
 
-    for folder in os.listdir(runs_dir):
-        try:
-            score_thresh_list = [0.6, 0.7, 0.75]
-            iou_thresh_list = [0.1, 0.15]
-            # score_thresh_list = [0.75]
-            # iou_thresh_list = [0.2]
-
-            if 'daB-m_new1-ep100-si320-lr0_001-wa1-baresnet18-iociou-bososa-clvari-io0_1-sc0_6-ga0_5-al0_5-dr0_01-fpTrue-trTrue-reTrue-lov3-we3_0_16_0_2_0-fp0_5_0_3_0_2' not in folder:
-                continue
-            # if 'resnet18' not in folder or 'lov3' not in folder or 'si320' not in folder:
-            #     continue
-
-            is_fpn, use_transformer, use_refine = parse_folder_flags(folder)
-
-            folder_path = os.path.join(runs_dir, folder)
-            if not os.path.isdir(folder_path) or folder == "reg":
-                continue
-
-            ckpt_path = os.path.join(folder_path, "model_epoch_best.pth")
-            if not os.path.isfile(ckpt_path):
-                print(f"跳过 {folder}：未找到 model_epoch_best.pth")
-                continue
-
-            print(f"验证模型：{folder}")
-
-            model_ = DynamicBoxDetector(
-                in_dim=img_size, hidden_dim=128, nhead=4, num_layers=2, cls_num=1,
-                once_embed=True, is_split_trans=False,
-                dropout=dropout, backbone_type=backbone_type,
-                is_fpn=is_fpn,
-                use_transformer=use_transformer,
-                use_refine=use_refine
-            ).to(DEVICE)
-            model_.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
-
-            output_csv = os.path.join(reg_path, f"validation_{folder}.csv")
-            score, config_ = run_validation_grid(
-                model_,
-                DEVICE,
-                train_loader_,
-                train_dataset,
-                val_loader_,
-                val_dataset,
-                use_softnms=use_softnms,
-                output_csv=output_csv,
-                score_thresh_list=score_thresh_list, iou_thresh_list=iou_thresh_list,
-                nms_method=nms_method,
-                base_path=runs_dir,
-            )
-
-            # === 新增：存储到列表 ===
-            config_row = {"folder": folder}
-            config_row.update(config_)
-            all_results.append(config_row)
-
-            if score > best_score:
-                best_score = score
-                best_config = config_
-                best_path = folder_path
-        except Exception as e:
-            print(e)
+    for data_name in data_names:
+        data_root = data_root_base + data_name
+        mean, std = get_mt(data_root_base, data_name, img_size)
+        # 初始化数据
+        train_dataset = YoloDataset(
+            img_dir=os.path.join(data_root, "test", 'images'),
+            label_dir=os.path.join(data_root, "test", 'labels'),
+            img_size=img_size,
+            cls_num=cls_nums,
+            mean=mean,
+            std=std,
+            normalize_label=True,
+            mode='test',
+        )
+        train_loader_ = DataLoader(train_dataset, batch_size=16, shuffle=False, collate_fn=custom_collate_fn,
+                                   num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=1, timeout=60)
+        val_dataset = YoloDataset(
+            img_dir=os.path.join(data_root, "val", 'images'),
+            label_dir=os.path.join(data_root, "val", 'labels'),
+            img_size=img_size,
+            cls_num=cls_nums,
+            mean=mean,
+            std=std,
+            mode='val',
+            normalize_label=True
+        )
+        val_loader_ = DataLoader(val_dataset, batch_size=16, shuffle=False, collate_fn=custom_collate_fn,
+                                 num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=1, timeout=60)
+        
+        best_score = -1
+        best_config = {}
+        best_path = ""
+    
+        for folder in os.listdir(runs_dir):
+            try:
+                score_thresh_list = [0.2,2.5,0.6, 0.7]
+                iou_thresh_list = [0.1, 0.15, 5.0, 6.0, 7.0]
+                # score_thresh_list = [0.05]
+                # iou_thresh_list = [0.1]
+    
+                if 'daC-m_new1-ep100-si320-lr0_001-wa1-baresnet18-iociou-bososa-clvari-io0_7-sc0_7-ga1_5-al0_5-dr0_01-fpTrue-trTrue-reTrue-lov3-we3_0_16_0_2_0-fp0_5_0_3_0_2' not in folder:
+                    continue
+                # if backbone_type not in folder or 'lov3' not in folder or 'si320' not in folder or f'da{data_name}' not in folder:
+                    # continue
+    
+                is_fpn, use_transformer, use_refine = parse_folder_flags(folder)
+    
+                folder_path = os.path.join(runs_dir, folder)
+                if not os.path.isdir(folder_path) or folder == "reg":
+                    continue
+    
+                ckpt_path = os.path.join(folder_path, "model_epoch_best.pth")
+                if not os.path.isfile(ckpt_path):
+                    print(f"跳过 {folder}：未找到 model_epoch_best.pth")
+                    continue
+    
+                print(f"验证模型：{folder}")
+    
+                model_ = DynamicBoxDetector(
+                    in_dim=img_size, hidden_dim=128, nhead=4, num_layers=2, cls_num=cls_nums,
+                    once_embed=True, is_split_trans=False,
+                    dropout=dropout, backbone_type=backbone_type,
+                    is_fpn=is_fpn,
+                    use_transformer=use_transformer,
+                    use_refine=use_refine
+                ).to(DEVICE)
+                model_.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+    
+                score, config_, run_results = run_validation_grid(
+                    model_,
+                    DEVICE,
+                    train_loader_,
+                    train_dataset,
+                    val_loader_,
+                    val_dataset,
+                    use_softnms=use_softnms,
+                    output_csv=output_csv,
+                    score_thresh_list=score_thresh_list, iou_thresh_list=iou_thresh_list,
+                    nms_method=nms_method,
+                    base_path=os.path.join(runs_dir, folder),
+                    folder=folder
+                )
+    
+                # === 新增：存储到列表 ===
+                config_row = {"folder": folder}
+                config_row.update(config_)
+                all_results.append(config_row)
+    
+                if score > best_score:
+                    best_score = score
+                    best_config = config_
+                    best_path = folder_path
+            except Exception as e:
+                print(e)
+        
+        print(f"\n✅ 所有验证完成，最好的: {best_path}")
+        print(f"🔥 最佳阈值配置:")
+        for k, v in best_config.items():
+            print(f"{k}: {v}")
 
     # === 循环结束后，写入 result.csv ===
     df = pd.DataFrame(all_results)
-    csv_path = os.path.join(reg_path, "result.csv")
+    csv_path = os.path.join(reg_path, "result_best.csv")
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     print(f"\n📂 所有结果已保存到 {csv_path}")
 
-    print(f"\n✅ 所有验证完成，最好的: {best_path}")
-    print(f"🔥 最佳阈值配置:")
-    for k, v in best_config.items():
-        print(f"{k}: {v}")

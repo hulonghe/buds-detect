@@ -200,45 +200,51 @@ class DetectionLoss(nn.Module):
             pred_cls_scores: Tensor[N, C] 未进行sigmoid
             gt_boxes: Tensor[M, 4] 同上
             tgt_labels: Tensor[M] 框所属类别ID，从0开始
-            topk: 初始每个 GT 最多选取的预测框数
-            epoch: 当前训练轮数
-            warmup_epoch: 仅 IoU 阈值 / topk_ratio 预热的轮数
-            decay_epochs: 在 warmup_epoch+10 后，做 topk_ratio/iou_thresh 过渡的轮数
         Returns:
             pos_mask: BoolTensor[N]，正样本掩码
             matched_gt_idx: LongTensor[#pos]，每个正样本对应的 GT 索引
         """
+        import math
         N, M = pred_boxes.size(0), gt_boxes.size(0)
         device = pred_boxes.device
 
         if M == 0 or N == 0:
             return torch.zeros(N, dtype=torch.bool, device=device), torch.zeros(0, dtype=torch.long, device=device)
 
-        # 1) 调用调度器，获取当前阈值
         iou_thresh, cur_score_thresh, cur_topk = self.get_thresholds(
             epoch=epoch, total_epochs=epochs, N=N, M=M, topk=topk, warmup_epoch=warmup_epoch, decay_epochs=decay_epochs
         )
-        # 2) 计算 IoU 矩阵
+
         ious = box_iou(pred_boxes, gt_boxes)
-        # 3) 计算每个预测框的最大 IoU，用于 adaptive score filter
-        max_ious_per_pred = ious.max(dim=1).values  # [N]
-        # 4) 计算每个预测框的分类最大概率
-        pred_probs = torch.sigmoid(pred_cls_scores)  # [N, C]
-        max_scores = pred_probs.max(dim=1).values  # [N]
-        # 5) IoU-aware score filter
-        adaptive_thresh = cur_score_thresh * (1 - max_ious_per_pred)  # IoU 越大，允许 score 越低
-        score_mask = max_scores > adaptive_thresh  # [N]
-        # 6) valid_mask，用于后续匹配
-        valid_mask = (ious > iou_thresh) & score_mask.unsqueeze(1)  # [N, M]
+        max_ious_per_pred = ious.max(dim=1).values
+        pred_probs = torch.sigmoid(pred_cls_scores)
+        max_scores = pred_probs.max(dim=1).values
 
-        # === 分类代价（交叉熵）===
-        tgt_labels_exp = tgt_labels.view(1, M).expand(N, M)  # [N, M]
+        adaptive_thresh = cur_score_thresh * (1 - max_ious_per_pred)
+        score_mask = max_scores > adaptive_thresh
+        valid_mask = (ious > iou_thresh) & score_mask.unsqueeze(1)
+
+        tgt_labels_exp = tgt_labels.view(1, M).expand(N, M)
         cls_cost = -torch.log(torch.gather(pred_probs, 1, tgt_labels_exp))
-        cls_cost[~valid_mask] = 1e5  # 屏蔽无效位置
+        cls_cost[~valid_mask] = 1e5
 
-        # === 综合代价：分类 cost - IoU 奖励 ===
-        cost = cls_cost * 1.0 - ious * 1.5 # [N, M]
-        # === TopK 匈牙利分配 ===
+        progress = epoch / max(1, epochs - 1)
+        cosine = (1 - math.cos(math.pi * progress)) / 2
+        iou_cost_weight = 0.5 + 1.0 * cosine
+
+        pred_cx = (pred_boxes[:, 0] + pred_boxes[:, 2]) / 2
+        pred_cy = (pred_boxes[:, 1] + pred_boxes[:, 3]) / 2
+        gt_cx = (gt_boxes[:, 0] + gt_boxes[:, 2]) / 2
+        gt_cy = (gt_boxes[:, 1] + gt_boxes[:, 3]) / 2
+        center_scale = 0.05
+        dist_x = (pred_cx.unsqueeze(1) - gt_cx.unsqueeze(0)) / center_scale
+        dist_y = (pred_cy.unsqueeze(1) - gt_cy.unsqueeze(0)) / center_scale
+        center_dist = torch.sqrt(dist_x ** 2 + dist_y ** 2)
+        center_cost = torch.clamp(center_dist, 0, 10) * 0.15
+        center_cost[~valid_mask] = 0
+
+        cost = cls_cost * 1.0 - ious * iou_cost_weight + center_cost
+
         cur_topk_clamped = min(cur_topk, N)
         topk_cost, topk_idx = torch.topk(cost.T, k=min(cur_topk_clamped, N), largest=False)
         matching_matrix = torch.zeros((N, M), device=device)
@@ -252,70 +258,20 @@ class DetectionLoss(nn.Module):
 
     def get_thresholds(self, epoch, N, M, total_epochs, topk=10, warmup_epoch=5, decay_epochs=5):
         """
-        返回当前 epoch 下的动态调度参数：
-        - iou_thresh
-        - score_thresh
-        - cur_topk
-
-        Args:
-            epoch (int): 当前epoch
-            N (int): 当前batch大小
-            M (int): 最大值
-            total_epochs (int): 总的epoch数
-            topk (int): topk值，默认10
-            warmup_epoch (int): warmup阶段的epoch数，默认5
-            decay_epochs (int): decay阶段的epoch数，默认5
+        全周期余弦渐变调度:
+        - score_thresh: 0.05 → self.score_thresh
+        - iou_thresh:   0.05 → self.iou_thresh
+        - topk:         25   → 15
         """
+        import math
+        progress = epoch / max(1, total_epochs - 1)
+        cosine = (1 - math.cos(math.pi * progress)) / 2
 
-        # 计算过渡阶段的epoch数
-        transition_epoch = int(total_epochs * 0.3)
+        iou_thresh_val = 0.05 + (self.iou_thresh - 0.05) * cosine
+        score_thresh_val = 0.05 + (self.score_thresh - 0.05) * cosine
+        cur_topk = max(10, int(20 - 5 * cosine))
 
-        # ---------------- iou_thresh 调度 ----------------
-        if epoch < warmup_epoch:
-            iou_thresh = self.iou_thresh * 0.1
-        elif epoch < warmup_epoch + transition_epoch:
-            # 过渡阶段，逐渐增加到最终值
-            alpha = (epoch - warmup_epoch) / transition_epoch
-            iou_thresh = self.iou_thresh * (0.1 + 0.9 * alpha)  # 0.1x → 1.0x
-        elif epoch < warmup_epoch + transition_epoch + decay_epochs:
-            # Decay阶段
-            beta = (epoch - (warmup_epoch + transition_epoch)) / decay_epochs
-            iou_thresh = self.iou_thresh * (1.0 + 0.0 * beta)
-        else:
-            iou_thresh = self.iou_thresh
-
-        # ---------------- score_thresh 调度 ----------------
-        if epoch < warmup_epoch:
-            score_thresh = 0.05
-        elif epoch < warmup_epoch + transition_epoch:
-            # 过渡阶段，逐渐增加到最终值
-            alpha = (epoch - warmup_epoch) / transition_epoch
-            score_thresh = 0.05 + alpha * (self.score_thresh - 0.05)  # 0.05 → self.score_thresh
-        else:
-            score_thresh = self.score_thresh
-
-        # ---------------- topk 调度 ----------------
-        warmup_topk = topk * 5
-        if epoch < warmup_epoch:
-            cur_topk = warmup_topk
-        elif epoch < warmup_epoch + transition_epoch:
-            # 过渡阶段，逐渐增加topk
-            alpha = (epoch - warmup_epoch) / transition_epoch
-            cur_topk = max(1, int(warmup_topk + (topk - warmup_topk) * alpha))
-        elif epoch < warmup_epoch + transition_epoch + decay_epochs:
-            decay_step = epoch - (warmup_epoch + transition_epoch)
-            decay_alpha = decay_step / decay_epochs
-            start_ratio, end_ratio = 1.0, 0.2
-            ratio = start_ratio + (end_ratio - start_ratio) * decay_alpha
-            cur_topk = max(10, min(int(N * ratio), M * topk))
-        else:
-            cur_topk = max(10, min(int(N * 0.2), M * topk))
-
-        # 保证最小正样本数
-        min_pos = max(10, int(N * 0.05))
-        cur_topk = max(cur_topk, min_pos)
-
-        return iou_thresh, score_thresh, cur_topk
+        return iou_thresh_val, score_thresh_val, cur_topk
 
     def get_aux_weight(self, cur_epoch, max_epoch):
         """
