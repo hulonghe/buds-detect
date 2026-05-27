@@ -351,7 +351,7 @@ if __name__ == '__main__':
         iou_thresh_list = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]
         # score_thresh_list = [0.4]
         # iou_thresh_list = [0.15]
-        if folder != 'daC-m_new1-ep100-si320-lr0_001-wa1-baresnet34-iociou-bososa-clvari-io0_1-sc0_6-ga2_5-al0_5-dr0_01-fpTrue-trTrue-reTrue-lov3-we3_0_16_0_2_0-fp0_5_0_3_0_2':
+        if folder != 'daC-m_new1-ep100-si320-lr0_001-wa1-baresnet18-iociou-bososa-clvari-io0_7-sc0_35-ga2_5-al0_5-dr0_01-fpTrue-trTrue-reTrue-lov3-we0_75_1_5_4_0_1_0-fp0_5_0_3_0_2-mo0_5-mo0_5':
             # if folder != 'dC-mdefault-e100-i320-l0_0001-w3-bresnet50-iciou-bsosa-cfocal-i0_25-s0_4-g1_0-a0_5-d0_1':  #
             # if folder != 'dteaRob_v9i_yolov11-mdefault-e100-i320-l0_0001-w1-bresnet50-iciou-bsosa-cfocal-i0_25-s0_25-g1_0-a0_5-d0_1':  #
             continue

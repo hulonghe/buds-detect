@@ -8,6 +8,8 @@ from torchvision.models import ResNet18_Weights, ResNet34_Weights, ResNet50_Weig
 from torchinfo import summary
 import torch.nn.functional as F
 
+import timm
+
 from nn.FPN import DynamicFPN
 from nn.depthwise_FPN import DynamicDepthwiseFPN
 from nn.small_obj_backbone import EHTBackboneV2
@@ -34,7 +36,8 @@ def init_all_heads(model, cls_num):
                     if m.bias is not None:
                         nn.init.constant_(m.bias, 0.0)
 
-                # 回归 head / refine head 最后一层 Conv
+                # 回归 head 最后一层 Conv [tx, ty, tw, th]
+                # tw, th = log(w/stride), log(h/stride), bias=0 → 初始框 = stride
                 elif is_reg and m.out_channels == 4:
                     nn.init.xavier_uniform_(m.weight, gain=0.1)
                     if m.bias is not None:
@@ -44,12 +47,70 @@ def init_all_heads(model, cls_num):
     for h in [model.score_head3, model.score_head4, model.score_head5]:
         init_head(h, is_cls=True)
 
+    # Quality heads
+    for h in [model.quality_head3, model.quality_head4, model.quality_head5]:
+        init_head(h, is_cls=True)
+
     # 回归 heads
     for h in [model.reg_head3, model.reg_head4, model.reg_head5]:
         init_head(h, is_reg=True)
     if model.use_refine:
         for h in [model.refine_head3, model.refine_head4, model.refine_head5]:
             init_head(h, is_reg=True)
+
+
+class YOLO26Backbone(nn.Module):
+    """YOLO26-N backbone 封装，输出 [C3, C4, C5] 对应 stride 8/16/32。"""
+
+    def __init__(self, weight_path='yolo26n.pt'):
+        super().__init__()
+        from ultralytics import YOLO
+        full = YOLO(weight_path, task='detect').model.model
+        backbone_layers = [full[i] for i in range(11)]
+        self.layers = nn.Sequential(*backbone_layers)
+
+    def forward(self, x):
+        feats = []
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if i in {4, 6, 8}:
+                feats.append(x)
+        return feats, None
+
+
+def _fix_efficientformer_attention(backbone):
+    """
+    EfficientFormer 的 Attention 使用固定分辨率（7x7）的相对位置偏置，
+    导致无法处理可变输入尺寸。此函数通过动态重算偏置索引来支持任意分辨率。
+    """
+    import math
+    from timm.models.efficientformer import Attention
+
+    for module in backbone.modules():
+        if isinstance(module, Attention):
+            orig_num_pos = module.attention_biases.shape[1]
+            orig_fwd = type(module).forward
+
+            @torch.no_grad()
+            def _patched_forward(self, x):
+                B, N, C = x.shape
+                if N != self.attention_bias_idxs.shape[0]:
+                    H = W = int(math.isqrt(N))
+                    while H * W < N:
+                        H += 1
+                    pos = torch.stack(torch.meshgrid(
+                        torch.arange(H, device=x.device),
+                        torch.arange(W, device=x.device),
+                        indexing='ij',
+                    )).flatten(1)
+                    rel_pos = (pos[..., :, None] - pos[..., None, :]).abs()
+                    rel_pos = (rel_pos[0] * W) + rel_pos[1]
+                    rel_pos = rel_pos.clamp(0, orig_num_pos - 1).long()
+                    self.attention_bias_idxs = rel_pos
+                    self.attention_bias_cache = {}
+                return orig_fwd(self, x)
+
+            module.forward = _patched_forward.__get__(module, type(module))
 
 
 class DynamicBoxDetector(nn.Module):
@@ -67,8 +128,18 @@ class DynamicBoxDetector(nn.Module):
         self.backbone_type = backbone_type
         self.use_transformer = use_transformer
         self.use_refine = use_refine
+        self.device = device
 
         # ---------------- Backbone ---------------- #
+        TIMM_BACKBONES = {
+            'efficientformer_l1', 'efficientformer_l3', 'efficientformer_l7',
+            'mobilevit_s', 'mobilevit_xs', 'mobilevit_xxs',
+            'edgenext_small', 'edgenext_x_small', 'edgenext_xx_small',
+        }
+        YOLO_BACKBONES = {'yolo26n'}
+        self._is_timm_backbone = backbone_type in TIMM_BACKBONES
+        self._is_yolo_backbone = backbone_type in YOLO_BACKBONES
+
         if backbone_type == 'smallobjnet':
             backbone = EHTBackboneV2(
                 in_ch=in_channels,
@@ -88,6 +159,13 @@ class DynamicBoxDetector(nn.Module):
                 'layer4': nn.Identity(),
                 '_impl': backbone
             })
+        elif self._is_yolo_backbone:
+            self.backbone = YOLO26Backbone(f'{backbone_type}.pt')
+        elif self._is_timm_backbone:
+            self.backbone = timm.create_model(backbone_type, pretrained=True, features_only=True)
+            if backbone_type.startswith('efficientformer'):
+                _fix_efficientformer_attention(self.backbone)
+                print(f"  [EfficientFormer] Attention patched for dynamic resolution")
         else:
             if backbone_type == 'resnet18':
                 backbone = models.resnet18(weights=ResNet18_Weights.DEFAULT)
@@ -100,7 +178,7 @@ class DynamicBoxDetector(nn.Module):
             elif backbone_type == 'resnet152':
                 backbone = models.resnet152(weights=ResNet152_Weights.DEFAULT)
             else:
-                raise ValueError("不支持的 backbone 类型")
+                raise ValueError(f"不支持的 backbone 类型: {backbone_type}")
             self.backbone = nn.ModuleDict({
                 'conv1': nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool),
                 'layer1': backbone.layer1,
@@ -165,6 +243,19 @@ class DynamicBoxDetector(nn.Module):
         self.score_head5 = make_cls_head(cls_head_kernel_size)
         self.reg_head5 = make_reg_head()
 
+        # Quality / centerness head（分离"是否前景"和"匹配质量"）
+        def make_quality_head():
+            return nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, groups=head_group),
+                nn.GroupNorm(hidden_dim // 4, hidden_dim),
+                nn.SiLU(),
+                nn.Conv2d(hidden_dim, 1, 1)
+            )
+
+        self.quality_head3 = make_quality_head()
+        self.quality_head4 = make_quality_head()
+        self.quality_head5 = make_quality_head()
+
         # Refine head（可选）
         if self.use_refine:
             def make_refine_head():
@@ -184,6 +275,13 @@ class DynamicBoxDetector(nn.Module):
     def _extract_features(self, x):
         if self.backbone_type == 'smallobjnet':
             return self.backbone['_impl'](x)  # 直接返回 [C3,C4,C5]
+        elif self._is_yolo_backbone:
+            feats, _ = self.backbone(x)
+            return feats, None  # 已返回 [C3,C4,C5]
+        elif self._is_timm_backbone:
+            feats = self.backbone(x)
+            # 统一取最后三级 [C3, C4, C5] (对应 stride 8/16/32)
+            return feats[-3:], None
         else:
             x = self.backbone['conv1'](x)
             c2 = self.backbone['layer1'](x)
@@ -295,6 +393,10 @@ class DynamicBoxDetector(nn.Module):
         score5 = self.score_head5(feat5_t)
         reg5 = self.reg_head5(feat5_t)
 
+        quality3 = self.quality_head3(feat3_t)
+        quality4 = self.quality_head4(feat4_t)
+        quality5 = self.quality_head5(feat5_t)
+
         # 生成网格
         def make_grid(H, W, device):
             gy, gx = torch.meshgrid(
@@ -311,21 +413,26 @@ class DynamicBoxDetector(nn.Module):
             reg4 = reg4 + self.refine_head4(torch.cat([feat4_t, reg4], dim=1))
             reg5 = reg5 + self.refine_head5(torch.cat([feat5_t, reg5], dim=1))
 
-        box3 = self.decode_boxes(reg3, grid3, stride3, scale=0.75)
+        box3 = self.decode_boxes(reg3, grid3, stride3, scale=1.25)
         box4 = self.decode_boxes(reg4, grid4, stride4, scale=1.0)
-        box5 = self.decode_boxes(reg5, grid5, stride5, scale=1.25)
+        box5 = self.decode_boxes(reg5, grid5, stride5, scale=0.75)
 
         score3_flat = score3.flatten(2).permute(0, 2, 1)
         score4_flat = score4.flatten(2).permute(0, 2, 1)
         score5_flat = score5.flatten(2).permute(0, 2, 1)
         score = torch.cat([score3_flat, score4_flat, score5_flat], dim=1)
 
+        quality3_flat = quality3.flatten(2).permute(0, 2, 1)
+        quality4_flat = quality4.flatten(2).permute(0, 2, 1)
+        quality5_flat = quality5.flatten(2).permute(0, 2, 1)
+        quality = torch.cat([quality3_flat, quality4_flat, quality5_flat], dim=1)
+
         box3_flat = box3.flatten(2).permute(0, 2, 1)
         box4_flat = box4.flatten(2).permute(0, 2, 1)
         box5_flat = box5.flatten(2).permute(0, 2, 1)
         box = torch.cat([box3_flat, box4_flat, box5_flat], dim=1)
 
-        return score, box, aux_logits
+        return score, box, quality, aux_logits
 
 
 def measure_latency(model, device, input_size=(1, 3, 320, 320), warmup=10, repeat=50):

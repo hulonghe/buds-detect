@@ -267,9 +267,9 @@ class DetectionLoss(nn.Module):
         progress = epoch / max(1, total_epochs - 1)
         cosine = (1 - math.cos(math.pi * progress)) / 2
 
-        iou_thresh_val = 0.05 + (self.iou_thresh - 0.05) * cosine
+        iou_thresh_val = 0.2 + (self.iou_thresh - 0.2) * cosine
         score_thresh_val = 0.05 + (self.score_thresh - 0.05) * cosine
-        cur_topk = max(10, int(20 - 5 * cosine))
+        cur_topk = max(4, int(10 - 6 * cosine))
 
         return iou_thresh_val, score_thresh_val, cur_topk
 

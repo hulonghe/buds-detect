@@ -119,8 +119,9 @@ def compute_ap_metrics(pred_list, gt_list, iou_thresholds=None,
                         scores.append(score)
                         labels.append(0)
 
-                        fp_type = categorize_fp(ious, matched, iou_thresh)
-                        fp_types_counter[fp_type] += 1
+                        if i == 0:
+                            fp_type = categorize_fp(ious, matched, iou_thresh)
+                            fp_types_counter[fp_type] += 1
 
                     if plot_iou_dist:
                         iou_distributions.append(max_iou_val)
@@ -129,13 +130,15 @@ def compute_ap_metrics(pred_list, gt_list, iou_thresholds=None,
             if total_gt == 0 or len(labels) == 0:
                 ap = 0.0
                 if i == 0:
+                    total_gt_05 += total_gt
+                    total_miss_05 += total_gt
                     per_class_stats[cls] = {
                         'class_id': cls,
                         'AP': 0.0,
                         'Precision': 0.0,
                         'Recall': 0.0,
                         'F1': 0.0,
-                        'Total_GT': 0
+                        'Total_GT': int(total_gt)
                     }
             else:
                 scores = np.array(scores)
@@ -220,15 +223,15 @@ def compute_ap_metrics(pred_list, gt_list, iou_thresholds=None,
                 'MR': mr
             })
 
+            # === FP 分类（仅 IoU=0.5）===
+            results.update({
+                'FPDup': fp_types_counter['dup'],
+                'FPOffset': fp_types_counter['offset'],
+                'FPBg': fp_types_counter['bg'],
+            })
+
     # === 最终 mAP ===
     results['mAP'] = np.mean(all_aps)
-
-    # === FP 分类 ===
-    results.update({
-        'FPDup': fp_types_counter['dup'],
-        'FPOffset': fp_types_counter['offset'],
-        'FPBg': fp_types_counter['bg'],
-    })
 
     # === 补全类别 ===
     final_stats = []

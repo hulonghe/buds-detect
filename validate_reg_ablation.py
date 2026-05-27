@@ -95,6 +95,7 @@ def validate_loader(model, device, data_loader, dataset,
     epoch_iou_loss = 0.0
     epoch_cls_loss = 0.0
     epoch_box_loss = 0.0
+    epoch_quality_loss = 0.0
 
     pbar = tqdm(data_loader, desc=f"Val | score={score_thresh} iou={iou_thresh}")
     for imgs, boxes, labels, log_targets, img_paths in pbar:
@@ -106,16 +107,19 @@ def validate_loader(model, device, data_loader, dataset,
         batch_size = imgs.size(0)
 
         with autocast(device_type=device, enabled=True):
-            score_maps, box_maps, aux_logits = model(imgs)
+            score_maps, box_maps, quality_maps, aux_logits = model(imgs)
             if criterion is not None:
-                total_loss, loss_cls, loss_box, loss_iou = criterion(score_maps, box_maps, aux_logits,
-                                                                     boxes, labels, log_targets,
-                                                                     epoch, epochs, warmup_epochs, weights_)
+                total_loss, loss_cls, loss_box, loss_iou, loss_quality = criterion(
+                    score_maps, box_maps, quality_maps, aux_logits,
+                    boxes, labels, log_targets,
+                    epoch, epochs, warmup_epochs, weights_)
                 epoch_loss += total_loss.cpu().item()
                 epoch_iou_loss += loss_iou.cpu().item()
                 epoch_cls_loss += loss_cls.cpu().item()
                 epoch_box_loss += loss_box.cpu().item()
-            score_maps = torch.sigmoid(score_maps)
+                epoch_quality_loss += loss_quality.cpu().item()
+            # cls * quality 融合为最终检测分数
+            score_maps = torch.sigmoid(score_maps) * torch.sigmoid(quality_maps)
 
         score_maps = score_maps.detach().cpu()
         box_maps = box_maps.detach().cpu()
@@ -125,8 +129,10 @@ def validate_loader(model, device, data_loader, dataset,
             score_thresh=score_thresh, iou_thresh=iou_thresh,
             upscale=False, method="soft-nms" if use_softnms == True else nms_method
         )
-        save_predictions_to_txt(batch_pred_boxes, batch_pred_scores, batch_pred_labels, img_paths,
-                                os.path.join(base_path, "labels"))
+        # 仅在训练结束或特定验证时保存预测结果，避免常规验证时的频繁I/O拖慢速度
+        if is_finish:
+            save_predictions_to_txt(batch_pred_boxes, batch_pred_scores, batch_pred_labels, img_paths,
+                                    os.path.join(base_path, "labels"))
 
         for i in range(batch_size):
             gt_boxes = boxes[i].cpu().numpy()
@@ -150,6 +156,7 @@ def validate_loader(model, device, data_loader, dataset,
     epoch_iou_loss /= len(data_loader)
     epoch_cls_loss /= len(data_loader)
     epoch_box_loss /= len(data_loader)
+    epoch_quality_loss /= len(data_loader)
 
     # === AP / Precision 等指标 ===
     metrics = compute_ap_metrics(
@@ -196,6 +203,7 @@ def validate_loader(model, device, data_loader, dataset,
         "val_iou_loss": epoch_iou_loss,
         "val_cls_loss": epoch_cls_loss,
         "val_box_loss": epoch_box_loss,
+        "val_quality_loss": epoch_quality_loss,
     }
 
 
@@ -225,7 +233,7 @@ def compute_score(entry, weights=None):
     if weights is None:
         weights = {
             "mAP": 0.4,
-            "AP@0.50": 0.4,
+            "mAP@0.50": 0.4,
             "Recall": 0.2,
         }
 
@@ -334,12 +342,12 @@ def parse_folder_flags(folder: str):
 
 
 if __name__ == '__main__':
-    set_seed(2025, False)
+    set_seed(2025, True, True)
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     cls_nums = 1
     backbone_type = "resnet18"
-    use_softnms = True
+    use_softnms = False
     nms_method = "nms"
     img_size = 320
     dropout = 0.0
@@ -386,7 +394,7 @@ if __name__ == '__main__':
             normalize_label=True,
             mode='test',
         )
-        train_loader_ = DataLoader(train_dataset, batch_size=16, shuffle=False, collate_fn=custom_collate_fn,
+        train_loader_ = DataLoader(train_dataset, batch_size=32, shuffle=False, collate_fn=custom_collate_fn,
                                    num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=1, timeout=60)
         val_dataset = YoloDataset(
             img_dir=os.path.join(data_root, "val", 'images'),
@@ -398,7 +406,7 @@ if __name__ == '__main__':
             mode='val',
             normalize_label=True
         )
-        val_loader_ = DataLoader(val_dataset, batch_size=16, shuffle=False, collate_fn=custom_collate_fn,
+        val_loader_ = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=custom_collate_fn,
                                  num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=1, timeout=60)
         
         best_score = -1
@@ -407,12 +415,12 @@ if __name__ == '__main__':
     
         for folder in os.listdir(runs_dir):
             try:
-                score_thresh_list = [0.2,2.5,0.6, 0.7]
-                iou_thresh_list = [0.1, 0.15, 5.0, 6.0, 7.0]
+                score_thresh_list = [0.15, 0.2, 0.25, 0.3, 0.35]
+                iou_thresh_list = [0.4, 0.5, 0.6, 0.7, 0.75]
                 # score_thresh_list = [0.05]
                 # iou_thresh_list = [0.1]
     
-                if 'daC-m_new1-ep100-si320-lr0_001-wa1-baresnet18-iociou-bososa-clvari-io0_7-sc0_7-ga1_5-al0_5-dr0_01-fpTrue-trTrue-reTrue-lov3-we3_0_16_0_2_0-fp0_5_0_3_0_2' not in folder:
+                if 'daC-m_new1-ep100-si320-lr0_001-wa1-baresnet18-iociou-bososa-clvari-io0_7-sc0_35-ga2_5-al0_5-dr0_01-fpTrue-trTrue-reTrue-lov3-we0_75_1_5_4_0_1_0-fp0_5_0_3_0_2-mo0_5-mo0_5' not in folder:
                     continue
                 # if backbone_type not in folder or 'lov3' not in folder or 'si320' not in folder or f'da{data_name}' not in folder:
                     # continue

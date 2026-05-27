@@ -5,7 +5,6 @@ from torchvision.ops import generalized_box_iou, box_iou
 
 # 假设这些自定义模块已存在
 from loss.SigmoidFocalLoss import SigmoidFocalLoss
-from loss.VarifocalLoss import VarifocalLoss
 from utils.ciou import complete_ciou
 from utils.eiou import complete_eiou
 from utils.diou import complete_diou
@@ -17,7 +16,7 @@ from utils.gwd import gwd_loss
 class DetectionLossV3(nn.Module):
     """
     ✅ 支持多类别 (Multi-class)
-    ✅ 数值等价 V1
+    ✅ 分离"是否前景"(cls)和"匹配质量"(quality)
     ✅ 避免 NxM 内存爆炸
     """
 
@@ -32,16 +31,14 @@ class DetectionLossV3(nn.Module):
         super().__init__()
 
         self.cls_num = cls_num
-        self.log_vars = nn.Parameter(torch.zeros(3))
+        self.log_vars = nn.Parameter(torch.zeros(4))  # cls, box, iou, quality
         self.aux_weight = 0.5
 
-        # 分类损失函数
-        if cls_type == 'focal':
-            self.cls_loss_fn = SigmoidFocalLoss(gamma=gamma, alpha=alpha, reduction='none')
-        elif cls_type == 'vari':
-            self.cls_loss_fn = VarifocalLoss(alpha=alpha, gamma=gamma, reduction='none')
-        else:
-            self.cls_loss_fn = nn.BCEWithLogitsLoss(reduction='none')
+        # 分类损失：二分类前景/背景 (SigmoidFocalLoss)
+        self.cls_loss_fn = SigmoidFocalLoss(gamma=gamma, alpha=alpha, reduction='none')
+
+        # 质量损失：IoU 回归 (BCE)
+        self.quality_loss_fn = nn.BCEWithLogitsLoss(reduction='none')
 
         # 边框损失函数
         if box_type == 'balanced':
@@ -69,7 +66,31 @@ class DetectionLossV3(nn.Module):
     # --------------------------
     # forward
     # --------------------------
-    def forward(self, pred_classes, pred_boxes, aux_logits,
+    def compute_sosa_loss(self, cls_pred, pred_boxes, gt_boxes, alpha=1.0, beta=1.0, gamma=2.0):
+        device = cls_pred.device
+        num_pos = cls_pred.size(0)
+        if num_pos == 0:
+            return torch.tensor(0.0, device=device)
+
+        cls_pred = torch.sigmoid(cls_pred)
+        cls_score, _ = cls_pred.max(dim=1)
+
+        with torch.no_grad():
+            ious = box_iou(pred_boxes, gt_boxes)
+            ious = torch.clamp(ious, min=1e-6, max=1.0)
+            q = torch.clamp((cls_score ** alpha) * (ious ** beta), min=1e-6, max=1.0)
+
+        weights = (1.0 - q) ** gamma
+        sosa_loss = - (weights * torch.log(q + 1e-6))
+        if torch.isnan(sosa_loss).any():
+            sosa_loss = torch.zeros_like(q).mean()
+        else:
+            sosa_loss = sosa_loss.mean()
+            norm_factor = sosa_loss.detach() + 1.0
+            sosa_loss = sosa_loss / norm_factor
+        return sosa_loss
+
+    def forward(self, pred_classes, pred_boxes, pred_quality, aux_logits,
                 target_boxes, target_labels, aux_targets,
                 epoch, epochs, warmup_epoch, weights=None):
 
@@ -109,10 +130,9 @@ class DetectionLossV3(nn.Module):
         pos_mask = torch.stack(pos_masks)  # [B,N]
 
         # --------------------------
-        # 2. Classification（多类别目标构建）
+        # 2. Classification（二分类前景/背景） + Quality（IoU 回归）
         # --------------------------
-        # 使用 self.cls_num 确保维度正确。
-        # 注意：这里假设 pred_classes 的最后一维大小等于 self.cls_num
+        # cls_target: binary 1/0 — 该位置是否为前景
         target_cls = torch.zeros((B, N, self.cls_num), dtype=pred_classes.dtype, device=device)
 
         for b in range(B):
@@ -123,31 +143,65 @@ class DetectionLossV3(nn.Module):
             matched_gt_idx = matched_indices[b]
             pos_idx = pos_masks[b]
 
-            # 1. 计算正样本匹配到的 GT 框的 IoU
-            # pred_boxes[b][pos_idx] 形状: [num_pos, 4]
-            # target_boxes[b][matched_gt_idx] 形状: [num_pos, 4]
-            ious_pos = box_iou(pred_boxes[b][pos_idx], target_boxes[b][matched_gt_idx])
-            
-            # box_iou 返回对角线元素，如果是单框则是标量，多框则是向量
-            if ious_pos.dim() == 2:
-                ious_pos = ious_pos.diag()
-            
-            # 2. 获取匹配到的 GT 的类别标签
-            # matched_gt_idx 是 GT 的索引，我们需要从 tgt_labels 中取出对应的类别 ID
             matched_labels = tgt_labels[matched_gt_idx]
 
-            # 3. 填充目标张量
-            # 这是一个高级索引操作：
-            # target_cls[b, pos_idx, matched_labels] = ious_pos
-            # 这将把对应位置、对应类别的值设为 IoU (用于 Varifocal 等)
-            target_cls[b, pos_idx, matched_labels] = ious_pos.detach().to(target_cls.dtype)
+            # 分类目标：binary 1（该位置是前景）
+            target_cls[b, pos_idx, matched_labels] = 1.0
 
-        # 计算分类损失
+        # 分类损失
         cls_loss_all = self.cls_loss_fn(pred_classes, target_cls)  # [B,N,C]
 
-        # per-sample mean
-        cls_loss_all = cls_loss_all.view(B, -1)
-        loss_cls = cls_loss_all.mean(dim=1).mean()
+        num_pos_total = pos_mask.sum()
+        if num_pos_total > 0:
+            loss_cls = cls_loss_all.sum() / num_pos_total
+        else:
+            cls_loss_all = cls_loss_all.view(B, -1)
+            loss_cls = cls_loss_all.mean(dim=1).mean()
+
+        # 质量损失：用 centerness 代替 IoU，提供尖锐的正负区分度
+        # centerness = sqrt(min(l,r)/max(l,r) * min(t,b)/max(t,b)) 在偏离中心时急剧衰减
+        if num_pos_total > 0:
+            pos_flat_q = pos_mask.view(-1)
+            pred_pos_boxes_q = pred_boxes.view(-1, 4)[pos_flat_q]
+            gt_list_q = []
+            for b in range(B):
+                if pos_masks[b].sum() == 0:
+                    continue
+                gt_list_q.append(target_boxes[b][matched_indices[b]])
+            matched_gt_boxes_q = torch.cat(gt_list_q, dim=0)
+
+            pred_cx = (pred_pos_boxes_q[:, 0] + pred_pos_boxes_q[:, 2]) / 2
+            pred_cy = (pred_pos_boxes_q[:, 1] + pred_pos_boxes_q[:, 3]) / 2
+            gt_cx = (matched_gt_boxes_q[:, 0] + matched_gt_boxes_q[:, 2]) / 2
+            gt_cy = (matched_gt_boxes_q[:, 1] + matched_gt_boxes_q[:, 3]) / 2
+
+            l = pred_cx - matched_gt_boxes_q[:, 0]
+            r = matched_gt_boxes_q[:, 2] - pred_cx
+            t = pred_cy - matched_gt_boxes_q[:, 1]
+            b = matched_gt_boxes_q[:, 3] - pred_cy
+
+            # centerness = sqrt(min(l,r)/max(l,r) * min(t,b)/max(t,b))
+            # clamp ratio 到 [0,1]：预测中心在框外时 ratio 为负 → clamp 到 0 → centerness=0
+            # lr_ratio = (torch.min(l, r) / torch.max(l, r).clamp(min=1e-6)).clamp(min=0.0, max=1.0)
+            # tb_ratio = (torch.min(t, b) / torch.max(t, b).clamp(min=1e-6)).clamp(min=0.0, max=1.0)
+            # centerness = torch.sqrt(lr_ratio * tb_ratio)
+
+            # target_quality = torch.zeros((B, N, 1), dtype=pred_classes.dtype, device=device)
+            # target_quality.view(B, N)[pos_mask] = centerness.detach().to(target_quality.dtype)
+
+            with torch.no_grad():
+                # matched_gt_boxes_q 和 pred_pos_boxes_q 已经在你的代码中提取出来了
+                ious_for_quality = box_iou(pred_pos_boxes_q, matched_gt_boxes_q).diag().clamp(0, 1.0)
+            target_quality = torch.zeros((B, N, 1), dtype=pred_classes.dtype, device=device)
+            target_quality.view(B, N)[pos_mask] = ious_for_quality.to(target_quality.dtype)
+
+            quality_loss_all = self.quality_loss_fn(pred_quality, target_quality)  # [B,N,1]
+            quality_loss_all = quality_loss_all.squeeze(-1)
+            loss_quality = (quality_loss_all * pos_mask.float()).sum() / num_pos_total
+            if torch.isnan(loss_quality) or torch.isinf(loss_quality):
+                loss_quality = torch.tensor(0.0, device=device)
+        else:
+            loss_quality = torch.tensor(0.0, device=device)
 
         # --------------------------
         # 3. Box + IoU（向量化）
@@ -173,6 +227,9 @@ class DetectionLossV3(nn.Module):
                 loss_box = gwd_loss(pred_xywh, gt_xywh)
             elif self.box_type == "balanced":
                 loss_box = self.balanced_l1_loss(pred_xywh, gt_xywh).mean()
+            elif self.box_type == "sosa":
+                pred_pos_cls = pred_classes.view(-1, C)[pos_flat]
+                loss_box = self.compute_sosa_loss(pred_pos_cls, pred_pos_boxes, matched_gt_boxes)
             else:
                 loss_box = F.smooth_l1_loss(pred_xywh, gt_xywh)
 
@@ -215,80 +272,83 @@ class DetectionLossV3(nn.Module):
         # --------------------------
         # 5. 权重融合
         # --------------------------
+        # 始终应用手动权重，作为 Loss 计算的先验基准
         if weights is not None:
-            cls_w, box_w, iou_w = weights
+            cls_w, box_w, iou_w = weights[:3]
+            quality_w = weights[3] if len(weights) > 3 else 1.0
             if cls_w is not None:
-                loss_cls *= cls_w
+                loss_cls = loss_cls * float(cls_w)
             if box_w is not None:
-                loss_box *= box_w
+                loss_box = loss_box * float(box_w)
             if iou_w is not None:
-                loss_iou *= iou_w
+                loss_iou = loss_iou * float(iou_w)
+            loss_quality = loss_quality * float(quality_w)
 
-        total_loss = self.compute_weighted_loss([loss_cls, loss_box, loss_iou])
+        total_loss = self.compute_weighted_loss([loss_cls, loss_box, loss_iou, loss_quality])
         total_loss += self.get_aux_weight(epoch, epochs * 0.3) * loss_aux
 
-        return total_loss, loss_cls.detach(), loss_box.detach(), loss_iou.detach()
+        return total_loss, loss_cls.detach(), loss_box.detach(), loss_iou.detach(), loss_quality.detach()
 
     # --------------------------
     # dynamic assign（多类别版本）
     # --------------------------
     def dynamic_assign(self, pred_boxes, pred_cls_scores, gt_boxes, tgt_labels,
                        epoch, epochs, warmup_epoch):
+        import math
 
-        # 1. 计算所有预测框和所有GT框的 IoU
-        # ious shape: [N, M] (N: anchors, M: gt_boxes)
+        N, M = pred_boxes.size(0), gt_boxes.size(0)
+        device = pred_boxes.device
+
+        if M == 0 or N == 0:
+            return torch.zeros(N, dtype=torch.bool, device=device), torch.zeros(0, dtype=torch.long, device=device)
+
+        progress = epoch / max(1, epochs - 1)
+        cosine = (1 - math.cos(math.pi * progress)) / 2
+
+        iou_thresh = 0.2 + (self.iou_thresh - 0.2) * cosine
+        score_thresh = 0.05 + (self.score_thresh - 0.05) * cosine
+        topk = max(4, int(10 - 6 * cosine))
+        iou_cost_weight = 0.5 + 1.5 * cosine
+
         ious = box_iou(pred_boxes, gt_boxes)
-        
-        pred_probs = torch.sigmoid(pred_cls_scores) # [N, C]
+        pred_probs = torch.sigmoid(pred_cls_scores)
 
-        # 2. 构建类别成本矩阵
-        # 我们需要知道每个预测框对于每个GT类别的预测概率
-        # tgt_labels shape: [M]
-        # 我们需要从 pred_probs 中取出对应类别的概率
-        
-        # 方法：将 tgt_labels 扩展为 [1, M]，然后 expand 到 [N, M]
-        # 这样我们就有了每个 GT 对应的类别 ID
-        tgt_labels_exp = tgt_labels.view(1, -1).expand(pred_boxes.size(0), -1) # [N, M]
-        
-        # 使用 gather 获取每个 GT 对应类别的预测概率
-        # pred_probs 是 [N, C], tgt_labels_exp 是 [N, M]
-        # 结果 prob_pos 是 [N, M]，表示预测框 i 预测为 GT j 类别的概率
+        max_ious_per_pred = ious.max(dim=1).values
+        max_scores = pred_probs.max(dim=1).values
+        # 使用固定阈值进行初步过滤，避免自适应阈值方向反导致的优化错误
+        score_mask = max_scores > 0.01
+        valid_mask = (ious > iou_thresh) & score_mask.unsqueeze(1)
+
+        tgt_labels_exp = tgt_labels.view(1, -1).expand(N, -1)
         prob_pos = torch.gather(pred_probs, 1, tgt_labels_exp)
-        
-        # 3. 计算分类成本
-        # 概率越高，成本越低 (-log(p))
         cls_cost = -torch.log(prob_pos.clamp(min=1e-7))
 
-        # 4. 总成本
-        # 我们想要最小化分类成本，最大化 IoU
-        # cost = cls_cost - ious * factor
-        cost = cls_cost - ious * 2.0
+        pred_cx = (pred_boxes[:, 0] + pred_boxes[:, 2]) / 2
+        pred_cy = (pred_boxes[:, 1] + pred_boxes[:, 3]) / 2
+        gt_cx = (gt_boxes[:, 0] + gt_boxes[:, 2]) / 2
+        gt_cy = (gt_boxes[:, 1] + gt_boxes[:, 3]) / 2
+        center_scale = 0.05
+        dist_x = (pred_cx.unsqueeze(1) - gt_cx.unsqueeze(0)) / center_scale
+        dist_y = (pred_cy.unsqueeze(1) - gt_cy.unsqueeze(0)) / center_scale
+        center_dist = torch.sqrt(dist_x ** 2 + dist_y ** 2)
+        center_cost = torch.clamp(center_dist, 0, 10) * 0.15
 
-        # 5. TopK 匹配
-        topk = min(15, pred_boxes.size(0))
-        # 对每个 GT (列)，找出成本最小的 TopK 个预测框 (行)
-        # cost.T shape: [M, N]
-        _, topk_idx = torch.topk(cost.T, k=topk, largest=False)
+        cost = cls_cost - ious * iou_cost_weight + center_cost
+        cost[~valid_mask] = 1e5
 
-        # 6. 构建匹配矩阵
-        matching_matrix = torch.zeros_like(cost) # [N, M]
-        
-        # 将 topk_idx 展平，作为行索引
-        # 列索引是每个 GT 重复 topk 次
-        matching_matrix[
-            topk_idx.reshape(-1), 
-            torch.arange(gt_boxes.size(0), device=cost.device).repeat_interleave(topk)
-        ] = 1
+        # 防止候选框不足 topk 导致 torch.topk 报错
+        k = min(topk, cost.size(1))
+        _, topk_idx = torch.topk(cost.T, k=k, largest=False)
 
-        # 7. 确定正样本
-        # 如果某行（预测框）被分配给了至少一个 GT，则为正样本
+        matching_matrix = torch.zeros_like(cost)
+        for gt_idx in range(M):
+            matching_matrix[topk_idx[gt_idx], gt_idx] = 1
+
         pos_mask = matching_matrix.sum(dim=1) > 0
-        
-        # 对于正样本，找到它匹配的是哪个 GT (取最大 IoU 或最小成本的那个)
-        # 这里简单地取匹配矩阵中为 1 的索引
-        # 注意：如果一个预测框匹配了多个 GT，通常取 IoU 最大的那个
-        # 但在这种 TopK 策略中，通常一个预测框只匹配一个 GT，或者取第一个
-        matched_gt_idx = matching_matrix[pos_mask].argmax(dim=1)
+        if pos_mask.sum() == 0:
+            matched_gt_idx = torch.zeros(0, dtype=torch.long, device=device)
+        else:
+            matched_gt_idx = matching_matrix[pos_mask].argmax(dim=1)
 
         return pos_mask, matched_gt_idx
 

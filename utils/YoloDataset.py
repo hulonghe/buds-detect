@@ -7,6 +7,7 @@ import psutil
 import torch
 import torch.utils.data as data
 import cv2
+from PIL import Image
 import matplotlib.pyplot as plt
 from utils.YOLOAugmentor import YOLOAugmentor
 from utils.helper import get_train_transform
@@ -173,10 +174,17 @@ class YoloDataset(data.Dataset):
 
         orig_w, orig_h, new_w, new_h = None, None, None, None
         if img_path not in self.image_cache:
-            img = cv2.imread(img_path)
+            # 快速获取原始尺寸（只读文件头，不解码像素）
+            with Image.open(img_path) as pil_img:
+                orig_w, orig_h = pil_img.size
+
+            # 大图（>2MP）用降采样读取，加速 I/O 和解码
+            if orig_w * orig_h > 1920 * 1080:
+                img = cv2.imread(img_path, cv2.IMREAD_REDUCED_COLOR_4)
+            else:
+                img = cv2.imread(img_path)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            # 获取原始图像的宽高
-            orig_h, orig_w, _ = img.shape
+
             if resize:
                 # 计算等比缩放的比例
                 scale = min(self.img_size * 2.0 / orig_w, self.img_size * 2.0 / orig_h)  # 保持宽高比进行缩放
